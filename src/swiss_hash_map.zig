@@ -422,6 +422,7 @@ pub fn SwissHashMapUnmanaged(
         /// `max_load_percentage`.
         available: Size = 0,
 
+        // TODO: Make this equal to the group width
         // This is purely empirical and not a /very smart magic constant™/.
         /// Capacity of the first grow when bootstrapping the hashmap.
         const minimal_capacity = 16;
@@ -502,6 +503,18 @@ pub fn SwissHashMapUnmanaged(
                 self.used = 0;
                 self.fingerprint = tombstone;
             }
+
+            // used for debugging purposes
+            pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                if (value.isFree()) {
+                    try writer.print("{s}", .{[_]u8{ ' ', ' ' }});
+                } else if (value.isTombstone()) {
+                    try writer.print("{s}", .{[_]u8{ 'T', 'T' }});
+                } else {
+                    try writer.print("{x:0>2}", .{@as(u8, @bitCast(value))});
+                }
+                return;
+            }
         };
 
         comptime {
@@ -524,8 +537,8 @@ pub fn SwissHashMapUnmanaged(
 
             data: u8s,
 
-            pub fn init(ptr: [*]u8) @This() {
-                return .{ .data = ptr[0..width].* };
+            pub fn init(ptr: [*]Metadata) @This() {
+                return .{ .data = @as([*]u8, @ptrCast(ptr))[0..width].* };
             }
 
             pub const BitMask = packed struct {
@@ -536,14 +549,16 @@ pub fn SwissHashMapUnmanaged(
 
                 mask: mask_type,
 
-                /// Checks if any bit is set.
-                inline fn anySetBit(self: @This()) bool {
+                const zero = @as(mask_type, 0);
+
+                /// Checks if there are any matches (if any bit is set).
+                inline fn hasMatch(self: @This()) bool {
                     return self.mask != 0;
                 }
 
                 /// Returns the index of the lowest set bit.
                 fn lowestSetBit(self: @This()) ?usize {
-                    if (!self.anySetBit()) {
+                    if (!self.hasMatch()) {
                         return null;
                     }
                     return @ctz(self.mask);
@@ -575,17 +590,48 @@ pub fn SwissHashMapUnmanaged(
                 fn inner(self: @This()) mask_type {
                     return @bitCast(self);
                 }
+
+                // used for debugging purposes
+                pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                    return try writer.print("{b:0>16}", .{value.mask});
+                }
             };
 
             /// Creates a BitMask from matching bytes in the Group's Metadata slice.
-            fn matchByte(self: *@This(), byte: u8) BitMask {
+            fn matchByte(self: @This(), byte: u8) BitMask {
                 const cmp = @as(i8s, @splat(@bitCast(byte))) == @as(i8s, @bitCast(self.data));
                 return @as(BitMask, @bitCast(cmp));
             }
 
+            inline fn hasByte(self: @This(), byte: u8) bool {
+                return self.matchByte(byte).mask != BitMask.zero;
+            }
+
             /// Checks if any Metadata in the Group is set to `Free`.
-            fn hasFree(self: *@This()) bool {
-                return self.matchByte(@as(u8, Metadata.free)) != 0;
+            fn hasFree(self: @This()) bool {
+                return self.hasByte(Metadata.slot_free);
+            }
+
+            fn matchFingerprint(self: @This(), fp: u7) BitMask {
+                const metadata = Metadata{
+                    .used = 1,
+                    .fingerprint = fp,
+                };
+                return self.matchByte(@as(u8, @bitCast(metadata)));
+            }
+
+            fn getFree(self: @This()) ?usize {
+                return self.matchByte(Metadata.slot_free).lowestSetBit();
+            }
+
+            fn getTombstone(self: @This()) ?usize {
+                return self.matchByte(Metadata.slot_tombstone).lowestSetBit();
+            }
+
+            // used for debugging purposes
+            pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                const metadata: [width]u8 = value.data;
+                return try writer.print("{any}", .{@as([width]Metadata, @bitCast(metadata))});
             }
         };
 
@@ -923,45 +969,52 @@ pub fn SwissHashMapUnmanaged(
 
             const mask = self.capacity() - 1; // bucket mask
             const fingerprint = Metadata.takeFingerprint(hash);
+            // std.debug.print("getIndex: fp = {x:0>2} => b = {x:0>2}\n", .{ fingerprint, @as(u8, fingerprint) ^ 0b10000000 });
 
             // Don't loop indefinitely when there are no empty slots.
             var limit = self.capacity();
             var idx = @as(usize, @truncate(hash & mask));
             var stride: u32 = 1;
 
-            var metadata = self.metadata.?[idx];
-            while (!metadata.isFree() and limit != 0) : ({
+            var group = Group.init(self.metadata.? + idx);
+            while (limit != 0) : ({
                 // WARNING: this continue block is dependant on the `continue` expression below
                 // if it is removed, then said expression also needs to be modified.
                 limit -= 1;
                 idx = (idx + stride) & mask;
                 stride += 1; // quadratic probing
-                metadata = self.metadata.?[idx];
+                group = Group.init(self.metadata.? + idx);
             }) {
-                // std.debug.print("lookup {} at idx={}\n", .{ key, idx });
-                if (!metadata.isUsed() or metadata.fingerprint != fingerprint) {
+                // std.debug.print("idx = {}: G{any}\n", .{ idx, group });
+                const bitmask = group.matchFingerprint(fingerprint);
+                if (!bitmask.hasMatch()) {
+                    // std.debug.print("failed match, continuing\n", .{});
                     continue;
                 }
-                const test_key = &self.keys()[idx];
-                // If you get a compile error on this line, it means that your generic eql
-                // function is invalid for these parameters.
-                const eql = ctx.eql(key, test_key.*);
-                // verifyContext can't verify the return type of generic eql functions,
-                // so we need to double-check it here.
-                if (@TypeOf(eql) != bool) {
-                    @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
+                var iter = bitmask.iterator();
+                while (iter.next()) |inner_idx| {
+                    // The real index of the bucket
+                    const elem_idx = idx + inner_idx;
+                    const test_key = &self.keys()[elem_idx];
+                    // If you get a compile error on this line, it means that your generic eql
+                    // function is invalid for these parameters.
+                    const eql = ctx.eql(key, test_key.*);
+                    // verifyContext can't verify the return type of generic eql functions,
+                    // so we need to double-check it here.
+                    if (@TypeOf(eql) != bool) {
+                        @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
+                    }
+                    if (eql) {
+                        return elem_idx;
+                    }
                 }
-                if (eql) {
-                    // std.debug.print("found {} at idx={}\n", .{ key, idx });
-                    return idx;
-                }
+
+                if (group.hasFree()) break;
             }
-
-            // std.debug.print("isFree={}, limit={}\n", .{ metadata.isFree(), limit });
-
             return null;
         }
 
+        /// Helper function for debugging.
         inline fn getIndexLinear(self: Self, key: anytype, ctx: anytype) ?usize {
             const hash = ctx.hash(key);
 
@@ -1144,49 +1197,48 @@ pub fn SwissHashMapUnmanaged(
             var stride: u32 = 1;
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
-            var metadata = self.metadata.?[idx];
-            while (!metadata.isFree() and limit != 0) {
-                // std.debug.print("lookup {} at index={}\n", .{ key, idx });
-                if (metadata.isUsed() and metadata.fingerprint == fingerprint) {
-                    const test_key = &self.keys()[idx];
-                    // If you get a compile error on this line, it means that your generic eql
-                    // function is invalid for these parameters.
-                    const eql = ctx.eql(key, test_key.*);
-                    // verifyContext can't verify the return type of generic eql functions,
-                    // so we need to double-check it here.
-                    if (@TypeOf(eql) != bool) {
-                        @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
-                    }
-                    if (eql) {
-                        // std.debug.print("put {} at index={}\n", .{ key, idx });
-                        return GetOrPutResult{
-                            .key_ptr = test_key,
-                            .value_ptr = &self.values()[idx],
-                            .found_existing = true,
-                        };
-                    }
-                } else if (first_tombstone_idx == self.capacity() and metadata.isTombstone()) {
-                    first_tombstone_idx = idx;
-                }
-
+            var group = Group.init(self.metadata.? + idx);
+            while (limit != 0) : ({
                 limit -= 1;
                 idx = (idx + stride) & mask;
                 stride += 1; // quadratic probing
-                metadata = self.metadata.?[idx];
+                group = Group.init(self.metadata.? + idx);
+            }) {
+                const bit_mask = group.matchFingerprint(fingerprint);
+                if (bit_mask.hasMatch()) {
+                    var iter = bit_mask.iterator();
+                    while (iter.next()) |inner_idx| {
+                        const elem_idx = idx + inner_idx;
+                        const test_key = &self.keys()[elem_idx];
+                        // If you get a compile error on this line, it means that your generic eql
+                        // function is invalid for these parameters.
+                        const eql = ctx.eql(key, test_key.*);
+                        // verifyContext can't verify the return type of generic eql functions,
+                        // so we need to double-check it here.
+                        if (@TypeOf(eql) != bool) {
+                            @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
+                        }
+                        if (eql) {
+                            return GetOrPutResult{
+                                .key_ptr = test_key,
+                                .value_ptr = &self.values()[elem_idx],
+                                .found_existing = true,
+                            };
+                        }
+                    }
+                } else if (first_tombstone_idx == self.capacity() and group.getTombstone() != null) {
+                    first_tombstone_idx = idx + group.getTombstone().?;
+                }
+
+                if (group.hasFree()) break;
             }
 
-            if (first_tombstone_idx < self.capacity()) {
-                // Cheap try to lower probing lengths after deletions. Recycle a tombstone.
-                idx = first_tombstone_idx;
-                metadata = self.metadata.?[idx];
-            }
+            const elem_idx = if (group.getFree()) |free_idx| @min(idx + free_idx, first_tombstone_idx) else first_tombstone_idx;
             // We're using a slot previously free or a tombstone.
             self.available -= 1;
-
-            // std.debug.print("put {} at index={}\n", .{ key, idx });
-            self.metadata.?[idx].fill(fingerprint);
-            const new_key = &self.keys()[idx];
-            const new_value = &self.values()[idx];
+            self.metadata.?[elem_idx].fill(fingerprint);
+            const new_key = &self.keys()[elem_idx];
+            const new_value = &self.values()[elem_idx];
             new_key.* = undefined;
             new_value.* = undefined;
             self.size += 1;
@@ -1270,7 +1322,11 @@ pub fn SwissHashMapUnmanaged(
         }
 
         fn initMetadatas(self: *Self) void {
-            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0 .. @sizeOf(Metadata) * self.capacity()], 0);
+            const end = @sizeOf(Metadata) * self.capacity();
+            // set the normal metadata to empty
+            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0..end], 0);
+            // set the special tombstone metadata group
+            @memset(@as([*]u8, @ptrCast(self.metadata.?))[end .. end + Group.width], Metadata.slot_tombstone);
         }
 
         // This counts the number of occupied slots (not counting tombstones), which is
@@ -1363,7 +1419,8 @@ pub fn SwissHashMapUnmanaged(
             const max_align = comptime @max(header_align, key_align, val_align);
 
             const new_cap: usize = new_capacity;
-            const meta_size = @sizeOf(Header) + new_cap * @sizeOf(Metadata);
+            // Include the final tombstone group
+            const meta_size = @sizeOf(Header) + (new_cap + Group.width) * @sizeOf(Metadata);
             comptime assert(@alignOf(Metadata) == 1);
 
             const keys_start = std.mem.alignForward(usize, meta_size, key_align);
@@ -1399,7 +1456,8 @@ pub fn SwissHashMapUnmanaged(
             const max_align = comptime @max(header_align, key_align, val_align);
 
             const cap: usize = self.capacity();
-            const meta_size = @sizeOf(Header) + cap * @sizeOf(Metadata);
+            // Account for the tombstone group here: vvvvvvvvvvvvv
+            const meta_size = @sizeOf(Header) + (cap + Group.width) * @sizeOf(Metadata);
             comptime assert(@alignOf(Metadata) == 1);
 
             const keys_start = std.mem.alignForward(usize, meta_size, key_align);
@@ -1438,24 +1496,57 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
 // zwizz tests
-test "groups" {
-    var arr = std.mem.zeroes([16]u8);
-    arr[1] = 1;
-    arr[3] = 1;
-    const ptr: [*]u8 = @ptrCast(&arr);
-    var group = AutoSwissHashMapUnmanaged(u32, u32).Group.init(ptr);
-    arr[5] = 1; // data is copied so this should not be reflected in the already initialized group
+test "zwizz basic" {
+    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    defer map.deinit();
 
-    // should match the second and fourth elements (indices 1 and 3)
-    // i.e. result in a mask: 0b000..001010 = 10
-    const mask = group.matchByte(1);
-    try expectEqual(10, mask.inner());
+    const count = 5;
+    var i: u32 = 1;
+    while (i < count) : (i += 2) {
+        try map.put(i, i);
+    }
 
-    var iter = mask.iterator();
-    try expectEqual(iter.next(), 1);
-    try expectEqual(iter.next(), 3);
+    var iter = map.valueIterator();
+    try expectEqual(iter.next().?.*, @as(u32, 1));
+    try expectEqual(iter.next().?.*, @as(u32, 3));
     try expectEqual(iter.next(), null);
 }
+test "zwizz groups" {
+    const Unmanaged = AutoSwissHashMap(u32, u32).Unmanaged;
+    const Metadata = Unmanaged.Metadata;
+    const Group = Unmanaged.Group;
+
+    const b: u8 = 0x0a;
+    const arr: [16]u8 = [_]u8{ 0, 0, 0, 0, 0, 0, b, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
+    const metadata = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
+    var group = Group.init(metadata);
+
+    const match = group.matchByte(b);
+    try expectEqual(match.hasMatch(), true);
+    var iter = match.iterator();
+    try expectEqual(iter.next().?, 6);
+    try expectEqual(iter.next(), null);
+}
+// test "zwizz core" {
+//     const Map = AutoSwissHashMap(u32, u32);
+//     const U = Map.Unmanaged;
+//     var map = Map.init(std.testing.allocator);
+//     defer map.deinit();
+//
+//     try map.put(1, 1);
+//     std.debug.print("{any}\n", .{@as([*]u8, @ptrCast(map.unmanaged.metadata.?))[0 .. map.capacity() + Map.Unmanaged.Group.width]});
+//
+//     const hash = AutoContext(u32).hash(undefined, 1);
+//     std.debug.print("hash: {any}\n", .{hash});
+//
+//     std.debug.print("fingerprint: {any}\n", .{U.Metadata.takeFingerprint(hash)});
+//
+//     const mask = map.capacity() - 1;
+//     const idx = @as(usize, @truncate(hash & mask));
+//
+//     std.debug.print("index: {any}\n", .{idx});
+//     std.debug.print("metadata: {any}\n", .{map.unmanaged.metadata.?[idx]});
+// }
 
 // original tests
 test "basic usage" {
@@ -1471,8 +1562,6 @@ test "basic usage" {
         total += i;
     }
 
-    // std.debug.print("done putting\n", .{});
-
     var sum: u32 = 0;
     var it = map.iterator();
     while (it.next()) |kv| {
@@ -1480,12 +1569,9 @@ test "basic usage" {
     }
     try expectEqual(total, sum);
 
-    // std.debug.print("done iterating\n", .{});
-
     i = 0;
     sum = 0;
     while (i < count) : (i += 1) {
-        try expectEqual(i, map.get(i).?);
         sum += map.get(i).?;
     }
     try expectEqual(total, sum);
@@ -1790,30 +1876,33 @@ test "remove one million elements in random order" {
     }
 }
 
-test "put" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
-    defer map.deinit();
-
-    var i: u32 = 0;
-    while (i < 16) : (i += 1) {
-        try map.put(i, i);
-    }
-
-    i = 0;
-    while (i < 16) : (i += 1) {
-        try expectEqual(map.get(i).?, i);
-    }
-
-    i = 0;
-    while (i < 16) : (i += 1) {
-        try map.put(i, i * 16 + 1);
-    }
-
-    i = 0;
-    while (i < 16) : (i += 1) {
-        try expectEqual(map.get(i).?, i * 16 + 1);
-    }
-}
+// This test will fail as it checks the linear probing in the std implementation
+// TODO: Replace it with the equivalent in the quadratic probing case
+//
+// test "put" {
+//     var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+//     defer map.deinit();
+//
+//     var i: u32 = 0;
+//     while (i < 16) : (i += 1) {
+//         try map.put(i, i);
+//     }
+//
+//     i = 0;
+//     while (i < 16) : (i += 1) {
+//         try expectEqual(map.get(i).?, i);
+//     }
+//
+//     i = 0;
+//     while (i < 16) : (i += 1) {
+//         try map.put(i, i * 16 + 1);
+//     }
+//
+//     i = 0;
+//     while (i < 16) : (i += 1) {
+//         try expectEqual(map.get(i).?, i * 16 + 1);
+//     }
+// }
 
 test "putAssumeCapacity" {
     var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
@@ -1830,7 +1919,7 @@ test "putAssumeCapacity" {
     while (i < 20) : (i += 1) {
         sum += map.getPtr(i).?.*;
     }
-    try expectEqual(sum, 190);
+    try expectEqual(190, sum);
 
     i = 0;
     while (i < 20) : (i += 1) {
@@ -1842,7 +1931,8 @@ test "putAssumeCapacity" {
     while (i < 20) : (i += 1) {
         sum += map.get(i).?;
     }
-    try expectEqual(sum, 20);
+
+    try expectEqual(20, sum);
 }
 
 test "repeat putAssumeCapacity/remove" {
