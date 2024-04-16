@@ -511,7 +511,14 @@ pub fn SwissHashMapUnmanaged(
 
         /// A Metadata slice that is checked in parallel
         pub const Group = struct {
+            // TODO: Make this selectable manually or automatically.
             const width = 16;
+
+            comptime {
+                // TODO: Add more validation here
+                assert(math.isPowerOfTwo(width));
+            }
+
             const u8s = @Vector(width, u8);
             const i8s = @Vector(width, i8);
 
@@ -522,12 +529,19 @@ pub fn SwissHashMapUnmanaged(
             }
 
             pub const BitMask = packed struct {
-                mask: u16,
+                const mask_type = @Type(.{ .Int = .{
+                    .signedness = .unsigned,
+                    .bits = width,
+                } });
 
+                mask: mask_type,
+
+                /// Checks if any bit is set.
                 inline fn anySetBit(self: @This()) bool {
                     return self.mask != 0;
                 }
 
+                /// Returns the index of the lowest set bit.
                 fn lowestSetBit(self: @This()) ?usize {
                     if (!self.anySetBit()) {
                         return null;
@@ -535,10 +549,12 @@ pub fn SwissHashMapUnmanaged(
                     return @ctz(self.mask);
                 }
 
+                /// Removes the lowest set bit.
                 fn removeLowestBit(self: *@This()) void {
                     self.mask &= self.mask - 1;
                 }
 
+                /// Iterator over the indices of set bits in a BitMask.
                 pub const Iterator = struct {
                     mask: BitMask,
 
@@ -555,20 +571,21 @@ pub fn SwissHashMapUnmanaged(
                     return .{ .mask = self };
                 }
 
-                // Helper function for testing.
-                // Returns self as a u16
-                fn inner(self: @This()) u16 {
+                /// Helper function for debugging.
+                fn inner(self: @This()) mask_type {
                     return @bitCast(self);
                 }
             };
 
+            /// Creates a BitMask from matching bytes in the Group's Metadata slice.
             fn matchByte(self: *@This(), byte: u8) BitMask {
                 const cmp = @as(i8s, @splat(@bitCast(byte))) == @as(i8s, @bitCast(self.data));
                 return @as(BitMask, @bitCast(cmp));
             }
 
+            /// Checks if any Metadata in the Group is set to `Free`.
             fn hasFree(self: *@This()) bool {
-                return self.matchByte(0) != 0;
+                return self.matchByte(@as(u8, Metadata.free)) != 0;
             }
         };
 
