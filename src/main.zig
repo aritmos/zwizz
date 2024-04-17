@@ -1,24 +1,38 @@
 const std = @import("std");
+const swiss = @import("swiss_hash_map.zig");
+const hm = @import("hash_map.zig");
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
-
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    try bw.flush(); // don't forget to flush!
+    // run(hm.AutoHashMap(u32, u32));
+    run(swiss.AutoSwissHashMap(u32, u32));
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+// 10M random put and remove
+fn run(Map: type) void {
+    const n = 10_000 * 1000;
+    var map = Map.init(std.heap.page_allocator);
+    defer map.deinit();
+
+    var keys = std.ArrayList(u32).init(std.heap.page_allocator);
+    defer keys.deinit();
+
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        keys.append(i) catch unreachable;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0);
+    const random = prng.random();
+    random.shuffle(u32, keys.items);
+
+    for (keys.items) |key| {
+        map.put(key, key) catch unreachable;
+    }
+
+    random.shuffle(u32, keys.items);
+    i = 0;
+    while (i < n) : (i += 1) {
+        const key = keys.items[i];
+        _ = map.remove(key);
+    }
 }
