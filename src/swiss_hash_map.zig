@@ -856,21 +856,22 @@ pub fn SwissHashMapUnmanaged(
             const mask = self.capacity() - 1;
             var idx = @as(usize, @truncate(hash & mask));
 
-            var metadata = self.metadata.? + idx;
             var stride: u32 = 1;
-            while (metadata[0].isUsed()) {
+            var group = Group.init(self.metadata.? + idx);
+            while (!group.hasFree()) {
                 idx = (idx + stride) & mask;
                 stride += 1;
-                metadata = self.metadata.? + idx;
+                group = Group.init(self.metadata.? + idx);
             }
 
             assert(self.available > 0);
             self.available -= 1;
 
             const fingerprint = Metadata.takeFingerprint(hash);
-            metadata[0].fill(fingerprint);
-            self.keys()[idx] = key;
-            self.values()[idx] = value;
+            const elem_idx = idx + group.getFree().?;
+            (self.metadata.? + elem_idx)[0].fill(fingerprint);
+            self.keys()[elem_idx] = key;
+            self.values()[elem_idx] = value;
 
             self.size += 1;
         }
@@ -1640,7 +1641,7 @@ test "grow" {
     while (i < growTo) : (i += 1) {
         try map.put(i, i);
     }
-    try expectEqual(map.count(), growTo);
+    try expectEqual(growTo, map.count());
 
     // std.debug.print("\n  <puts done>\n", .{});
 
