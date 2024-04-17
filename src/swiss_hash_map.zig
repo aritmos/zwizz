@@ -380,10 +380,7 @@ pub fn SwissHashMap(
         /// Helper debug function to view the keys nicely
         /// when using the testing allocator
         fn printKeys(self: *Self) void {
-            // not possible: assert(self.allocator == std.testing.allocator);
-            const keys = self.unmanaged.header().keys[0..self.capacity()];
-            const formatted_keys = @as([]Key(K), @ptrCast(keys));
-            std.debug.print("{any}\n", .{formatted_keys});
+            return self.unmanaged.printKeys();
         }
     };
 }
@@ -884,29 +881,27 @@ pub fn SwissHashMapUnmanaged(
 
             const hash = ctx.hash(key);
             const mask = self.capacity() - 1;
-            var idx = @as(usize, @truncate(hash & mask));
+            var pos = @as(usize, @truncate(hash & mask));
 
-            var stride: u32 = 1;
-            var group = Group.init(self.metadata.? + idx);
-            while (!group.hasAvailable()) {
-                idx = (idx + stride) & mask;
-                stride += 1;
-                group = Group.init(self.metadata.? + idx);
+            var stride: u32 = 0;
+            var group = Group.init(self.metadata.? + pos);
+            while (!(group.hasAvailable() and pos + (group.getTombstone() orelse Group.width) < self.capacity())) {
+                stride += Group.width;
+                assert(stride < self.capacity());
+                pos = (pos + stride) & mask;
+                group = Group.init(self.metadata.? + pos);
             }
 
             assert(self.available > 0);
             self.available -= 1;
 
             const fingerprint = Metadata.takeFingerprint(hash);
-            const elem_idx = idx + group.getAvailable().?;
-            assert(elem_idx < self.capacity());
+            const elem_idx = pos + group.getAvailable().?;
             (self.metadata.? + elem_idx)[0].fill(fingerprint);
             self.keys()[elem_idx] = key;
             self.values()[elem_idx] = value;
 
             self.size += 1;
-
-            // std.debug.print("put key {} at index {}\n", .{ key, elem_idx });
         }
 
         /// Inserts a new `Entry` into the hash map, returning the previous one, if any.
@@ -1003,25 +998,23 @@ pub fn SwissHashMapUnmanaged(
 
             const mask = self.capacity() - 1; // bucket mask
             const fingerprint = Metadata.takeFingerprint(hash);
-            // std.debug.print("getIndex: fp = {x:0>2} => b = {x:0>2}\n", .{ fingerprint, @as(u8, fingerprint) ^ 0b10000000 });
 
             // Don't loop indefinitely when there are no empty slots.
             var limit = self.capacity();
             var idx = @as(usize, @truncate(hash & mask));
-            var stride: u32 = 1;
+            var stride: u32 = 0;
 
             while (limit != 0) : ({
                 // WARNING: this continue block is dependant on the `continue` expression below
                 // if it is removed, then said expression also needs to be modified.
+                stride += Group.width; // quadratic probing
                 limit -= 1;
                 idx = (idx + stride) & mask;
-                stride += 1; // quadratic probing
+                assert(stride < self.capacity());
             }) {
                 const group = Group.init(self.metadata.? + idx);
-                // std.debug.print("idx = {}: G{any}\n", .{ idx, group });
                 const bitmask = group.matchFingerprint(fingerprint);
                 if (!bitmask.hasMatch()) {
-                    // std.debug.print("failed match, continuing\n", .{});
                     continue;
                 }
                 var iter = bitmask.iterator();
@@ -1227,14 +1220,15 @@ pub fn SwissHashMapUnmanaged(
 
             var limit = self.capacity();
             var idx = @as(usize, @truncate(hash & mask));
-            var stride: u32 = 1;
+            var stride: u32 = 0;
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
             var group = Group.init(self.metadata.? + idx);
             while (limit != 0) : ({
                 limit -= 1;
+                stride += Group.width; // quadratic probing
                 idx = (idx + stride) & mask;
-                stride += 1; // quadratic probing
+                assert(stride < self.capacity());
                 group = Group.init(self.metadata.? + idx);
             }) {
                 const bit_mask = group.matchFingerprint(fingerprint);
@@ -1275,7 +1269,6 @@ pub fn SwissHashMapUnmanaged(
             new_key.* = undefined;
             new_value.* = undefined;
             self.size += 1;
-
             return GetOrPutResult{
                 .key_ptr = new_key,
                 .value_ptr = new_value,
@@ -1359,7 +1352,7 @@ pub fn SwissHashMapUnmanaged(
             // set the normal metadata to empty
             @memset(@as([*]u8, @ptrCast(self.metadata.?))[0..end], 0);
             // set the special end metadata group (can't be tombstone due to putAssumeCapacityNoClobber)
-            @memset(@as([*]u8, @ptrCast(self.metadata.?))[end .. end + Group.width], 0b10101010);
+            @memset(@as([*]u8, @ptrCast(self.metadata.?))[end .. end + Group.width], Metadata.slot_tombstone);
         }
 
         // This counts the number of occupied slots (not counting tombstones), which is
@@ -1521,6 +1514,15 @@ pub fn SwissHashMapUnmanaged(
                 _ = &dbHelper;
             }
         }
+
+        /// Helper debug function to view the keys nicely
+        /// when using the testing allocator
+        fn printKeys(self: *Self) void {
+            // not possible: assert(self.allocator == std.testing.allocator);
+            const keys_ = self.header().keys[0 .. math.ceilPowerOfTwo(u32, self.capacity()) catch unreachable];
+            const formatted_keys = @as([]Key(K), @ptrCast(keys_));
+            std.debug.print("KK{any}\n", .{formatted_keys});
+        }
     };
 }
 
@@ -1530,9 +1532,9 @@ fn Key(key: type) type {
 
         pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
             if (value.val == 2863311530) {
-                try writer.print(" ", .{});
+                try writer.print("  ", .{});
             } else {
-                try writer.print("{}", .{value.val});
+                try writer.print("{: >2}", .{value.val});
             }
         }
     };
@@ -1541,6 +1543,10 @@ fn Key(key: type) type {
 const testing = std.testing;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+
+fn cprint(expr: bool, comptime fmt: []const u8, args: anytype) void {
+    if (expr) std.debug.print(fmt, args);
+}
 
 // zwizz tests
 // test "zwizz test" {
@@ -1996,7 +2002,7 @@ test "repeat putAssumeCapacity/remove" {
 
     try map.ensureTotalCapacity(20);
     const limit = map.unmanaged.available;
-    // std.debug.print("\nlimit = {}\n", .{limit});
+    // std.debug.print("\nlimit = {}, capacity = {}\n", .{ limit, map.unmanaged.capacity() });
     // std.debug.print("\ninitial put\n", .{});
 
     var i: u32 = 0;
@@ -2004,28 +2010,24 @@ test "repeat putAssumeCapacity/remove" {
         map.putAssumeCapacityNoClobber(i, i);
     }
 
+    // cprint(true, "DONE\n", .{});
     // map.printKeys();
+    // cprint(true, "---\n", .{});
 
     // Repeatedly delete/insert an entry without resizing the map.
     // Put to different keys so entries don't land in the just-freed slot.
     i = 0;
     while (i < 10 * limit) : (i += 1) {
-        // std.debug.print("remove key = {}, left with s={}, a={}\n", .{ i, map.unmanaged.size, map.unmanaged.available + 1 });
         try testing.expect(map.remove(i));
-        // std.debug.print("{any} \n", .{map.unmanaged.metadata.?[0..map.unmanaged.size]});
-        // map.printKeys();
+        // cprint(limit + i == 70, "STARTING KEY=70 (VAL = {})\n", .{i});
         if (i % 2 == 0) {
-            // std.debug.print("-> pACNC with {}\n", .{limit + i});
             map.putAssumeCapacityNoClobber(limit + i, i);
-            // map.printKeys();
         } else {
-            // std.debug.print("-> pAC with {}\n", .{limit + i});
             map.putAssumeCapacity(limit + i, i);
-            // map.printKeys();
         }
     }
 
-    // std.debug.print("pre get\n", .{});
+    std.debug.print("pre get\n", .{});
 
     i = 9 * limit;
     while (i < 10 * limit) : (i += 1) {
