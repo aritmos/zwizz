@@ -437,6 +437,12 @@ pub fn SwissHashMapUnmanaged(
         /// Equal to (capacity / group width)
         num_groups: Size = 0,
 
+        num_lookups: *u64 = undefined,
+
+        pub fn init_lookups(self: *Self, ptr: *u64) void {
+            self.num_lookups = ptr;
+        }
+
         // TODO: Make this equal to the group width
         // This is purely empirical and not a /very smart magic constant™/.
         /// Capacity of the first grow when bootstrapping the hashmap.
@@ -896,6 +902,7 @@ pub fn SwissHashMapUnmanaged(
 
             var stride: u32 = 0;
             var group = Group.init(self.metadata.? + pos * Group.width);
+            self.num_lookups.* += 1;
             while (!group.hasAvailable()) {
                 stride += 1;
                 assert(stride < self.num_groups);
@@ -1026,6 +1033,7 @@ pub fn SwissHashMapUnmanaged(
                 pos = (pos + stride) & mask;
             }) {
                 const group = Group.init(self.metadata.? + pos * Group.width);
+                self.num_lookups.* += 1;
                 const bitmask = group.matchFingerprint(fingerprint);
                 if (!bitmask.hasMatch()) {
                     continue;
@@ -1238,6 +1246,7 @@ pub fn SwissHashMapUnmanaged(
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
             var group = Group.init(self.metadata.? + pos * Group.width);
+            self.num_lookups.* += 1;
             while (limit != 0) : ({
                 limit -= 1;
                 stride += 1; // quadratic probing
@@ -1246,6 +1255,7 @@ pub fn SwissHashMapUnmanaged(
                 // assert(stride < self.num_groups);
                 pos = (pos + stride) & mask;
                 group = Group.init(self.metadata.? + pos * Group.width);
+                self.num_lookups.* += 1;
             }) {
                 const bit_mask = group.matchFingerprint(fingerprint);
                 if (bit_mask.hasMatch()) {
@@ -1431,6 +1441,7 @@ pub fn SwissHashMapUnmanaged(
 
             var map = Self{};
             defer map.deinit(allocator);
+            map.init_lookups(self.num_lookups);
             try map.allocate(allocator, new_cap);
             map.initMetadatas();
             map.available = @truncate((new_cap * max_load_percentage) / 100);

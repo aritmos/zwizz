@@ -3,15 +3,18 @@ const swiss = @import("swiss_hash_map.zig");
 const hm = @import("hash_map.zig");
 
 pub fn main() !void {
-    // run(hm.AutoHashMap(u32, u32));
-    run(swiss.AutoSwissHashMap(u32, u32));
+    const l = lookups(hm.AutoHashMap(u32, u32));
+    // const l = lookups(swiss.AutoSwissHashMap(u32, u32));
+    std.debug.print("{}\n", .{l});
 }
 
 // 10M random put and remove
-fn run(Map: type) void {
+fn lookups(Map: type) u64 {
     const n = 10_000 * 1000;
     var map = Map.init(std.heap.page_allocator);
     defer map.deinit();
+    var counter: u64 = 0;
+    map.unmanaged.init_lookups(&counter);
 
     var keys = std.ArrayList(u32).init(std.heap.page_allocator);
     defer keys.deinit();
@@ -35,4 +38,6 @@ fn run(Map: type) void {
         const key = keys.items[i];
         _ = map.remove(key);
     }
+
+    return counter;
 }
