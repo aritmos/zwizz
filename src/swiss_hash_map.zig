@@ -377,6 +377,10 @@ pub fn SwissHashMap(
             return result;
         }
 
+        fn validate(self: Self) !void {
+            return self.unmanaged.validate();
+        }
+
         /// Helper debug function to view the keys nicely
         /// when using the testing allocator
         fn printKeys(self: *Self) void {
@@ -427,6 +431,11 @@ pub fn SwissHashMapUnmanaged(
         /// Number of available slots before a grow is needed to satisfy the
         /// `max_load_percentage`.
         available: Size = 0,
+
+        // This is updated when calling `allocate` (grow can be skipped, e.g. `clone`)
+        /// Number of groups in the probing sequence.
+        /// Equal to (capacity / group width)
+        num_groups: Size = 0,
 
         // TODO: Make this equal to the group width
         // This is purely empirical and not a /very smart magic constant™/.
@@ -749,7 +758,8 @@ pub fn SwissHashMapUnmanaged(
         fn capacityForSize(size: Size) Size {
             var new_cap: u32 = @intCast((@as(u64, size) * 100) / max_load_percentage + 1);
             new_cap = math.ceilPowerOfTwo(u32, new_cap) catch unreachable;
-            return new_cap;
+            // Ensure we at least have one probable group
+            return @max(new_cap, Group.width);
         }
 
         pub fn ensureTotalCapacity(self: *Self, allocator: Allocator, new_size: Size) Allocator.Error!void {
@@ -880,26 +890,27 @@ pub fn SwissHashMapUnmanaged(
             assert(!self.containsContext(key, ctx));
 
             const hash = ctx.hash(key);
-            const mask = self.capacity() - 1;
+            assert(self.num_groups > 0);
+            const mask = self.num_groups - 1;
             var pos = @as(usize, @truncate(hash & mask));
 
             var stride: u32 = 0;
-            var group = Group.init(self.metadata.? + pos);
-            while (!(group.hasAvailable() and pos + (group.getTombstone() orelse Group.width) < self.capacity())) {
-                stride += Group.width;
-                assert(stride < self.capacity());
+            var group = Group.init(self.metadata.? + pos * Group.width);
+            while (!group.hasAvailable()) {
+                stride += 1;
+                assert(stride < self.num_groups);
                 pos = (pos + stride) & mask;
-                group = Group.init(self.metadata.? + pos);
+                group = Group.init(self.metadata.? + pos * Group.width);
             }
 
             assert(self.available > 0);
             self.available -= 1;
 
             const fingerprint = Metadata.takeFingerprint(hash);
-            const elem_idx = pos + group.getAvailable().?;
-            (self.metadata.? + elem_idx)[0].fill(fingerprint);
-            self.keys()[elem_idx] = key;
-            self.values()[elem_idx] = value;
+            const idx = pos * Group.width + group.getAvailable().?;
+            (self.metadata.? + idx)[0].fill(fingerprint);
+            self.keys()[idx] = key;
+            self.values()[idx] = value;
 
             self.size += 1;
         }
@@ -996,32 +1007,34 @@ pub fn SwissHashMapUnmanaged(
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
 
-            const mask = self.capacity() - 1; // bucket mask
+            assert(self.num_groups > 0);
+            const mask = self.num_groups - 1; // bucket mask
             const fingerprint = Metadata.takeFingerprint(hash);
 
             // Don't loop indefinitely when there are no empty slots.
-            var limit = self.capacity();
-            var idx = @as(usize, @truncate(hash & mask));
+            var limit = self.num_groups;
+            var pos = @as(usize, @truncate(hash & mask));
             var stride: u32 = 0;
 
             while (limit != 0) : ({
                 // WARNING: this continue block is dependant on the `continue` expression below
                 // if it is removed, then said expression also needs to be modified.
-                stride += Group.width; // quadratic probing
                 limit -= 1;
-                idx = (idx + stride) & mask;
-                assert(stride < self.capacity());
+                // TODO: remove limit and make the conditional the stride assertion?
+                // no `assert(stride < self.num_groups)` needed as this is covered by limit
+                stride += 1; // quadratic probing
+                pos = (pos + stride) & mask;
             }) {
-                const group = Group.init(self.metadata.? + idx);
+                const group = Group.init(self.metadata.? + pos * Group.width);
                 const bitmask = group.matchFingerprint(fingerprint);
                 if (!bitmask.hasMatch()) {
                     continue;
                 }
                 var iter = bitmask.iterator();
-                while (iter.next()) |inner_idx| {
+                while (iter.next()) |bit| {
                     // The real index of the bucket
-                    const elem_idx = idx + inner_idx;
-                    const test_key = &self.keys()[elem_idx];
+                    const idx = pos * Group.width + bit;
+                    const test_key = &self.keys()[idx];
                     // If you get a compile error on this line, it means that your generic eql
                     // function is invalid for these parameters.
                     const eql = ctx.eql(key, test_key.*);
@@ -1031,7 +1044,7 @@ pub fn SwissHashMapUnmanaged(
                         @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                     }
                     if (eql) {
-                        return elem_idx;
+                        return idx;
                     }
                 }
 
@@ -1215,28 +1228,31 @@ pub fn SwissHashMapUnmanaged(
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
 
-            const mask = self.capacity() - 1;
+            assert(self.num_groups > 0);
+            const mask = self.num_groups - 1;
             const fingerprint = Metadata.takeFingerprint(hash);
 
-            var limit = self.capacity();
-            var idx = @as(usize, @truncate(hash & mask));
+            var limit = self.num_groups;
+            var pos = @as(usize, @truncate(hash & mask));
             var stride: u32 = 0;
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
-            var group = Group.init(self.metadata.? + idx);
+            var group = Group.init(self.metadata.? + pos * Group.width);
             while (limit != 0) : ({
                 limit -= 1;
-                stride += Group.width; // quadratic probing
-                idx = (idx + stride) & mask;
-                assert(stride < self.capacity());
-                group = Group.init(self.metadata.? + idx);
+                stride += 1; // quadratic probing
+                // Assertion not needed due to `limit` giving the same bound
+                // TODO: remove limit?
+                // assert(stride < self.num_groups);
+                pos = (pos + stride) & mask;
+                group = Group.init(self.metadata.? + pos * Group.width);
             }) {
                 const bit_mask = group.matchFingerprint(fingerprint);
                 if (bit_mask.hasMatch()) {
                     var iter = bit_mask.iterator();
-                    while (iter.next()) |inner_idx| {
-                        const elem_idx = idx + inner_idx;
-                        const test_key = &self.keys()[elem_idx];
+                    while (iter.next()) |bit| {
+                        const idx = pos * Group.width + bit;
+                        const test_key = &self.keys()[idx];
                         // If you get a compile error on this line, it means that your generic eql
                         // function is invalid for these parameters.
                         const eql = ctx.eql(key, test_key.*);
@@ -1248,27 +1264,28 @@ pub fn SwissHashMapUnmanaged(
                         if (eql) {
                             return GetOrPutResult{
                                 .key_ptr = test_key,
-                                .value_ptr = &self.values()[elem_idx],
+                                .value_ptr = &self.values()[idx],
                                 .found_existing = true,
                             };
                         }
                     }
-                } else if (first_tombstone_idx == self.capacity() and group.getTombstone() != null) {
-                    first_tombstone_idx = idx + group.getTombstone().?;
+                } else if (first_tombstone_idx == self.capacity()) {
+                    if (group.getTombstone()) |bit| first_tombstone_idx = pos * Group.width + bit;
                 }
 
                 if (group.hasFree()) break;
             }
 
-            const elem_idx = if (group.getFree()) |free_idx| @min(idx + free_idx, first_tombstone_idx) else first_tombstone_idx;
+            const idx = if (group.getFree()) |bit| @min(pos * Group.width + bit, first_tombstone_idx) else first_tombstone_idx;
             // We're using a slot previously free or a tombstone.
             self.available -= 1;
-            self.metadata.?[elem_idx].fill(fingerprint);
-            const new_key = &self.keys()[elem_idx];
-            const new_value = &self.values()[elem_idx];
+            self.metadata.?[idx].fill(fingerprint);
+            const new_key = &self.keys()[idx];
+            const new_value = &self.values()[idx];
             new_key.* = undefined;
             new_value.* = undefined;
             self.size += 1;
+
             return GetOrPutResult{
                 .key_ptr = new_key,
                 .value_ptr = new_value,
@@ -1349,10 +1366,8 @@ pub fn SwissHashMapUnmanaged(
 
         fn initMetadatas(self: *Self) void {
             const end = @sizeOf(Metadata) * self.capacity();
-            // set the normal metadata to empty
-            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0..end], 0);
-            // set the special end metadata group (can't be tombstone due to putAssumeCapacityNoClobber)
-            @memset(@as([*]u8, @ptrCast(self.metadata.?))[end .. end + Group.width], Metadata.slot_tombstone);
+            // Set all Metadatas to Free
+            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0..end], Metadata.slot_free);
         }
 
         // This counts the number of occupied slots (not counting tombstones), which is
@@ -1395,6 +1410,7 @@ pub fn SwissHashMapUnmanaged(
                         break;
                 }
             }
+            assert(other.size == self.size);
 
             return other;
         }
@@ -1432,6 +1448,7 @@ pub fn SwissHashMapUnmanaged(
                             break;
                     }
                 }
+                assert(map.size == self.size);
             }
 
             self.size = 0;
@@ -1439,14 +1456,16 @@ pub fn SwissHashMapUnmanaged(
         }
 
         fn allocate(self: *Self, allocator: Allocator, new_capacity: Size) Allocator.Error!void {
+            assert(math.isPowerOfTwo(new_capacity));
+            self.num_groups = new_capacity / Group.width;
+
             const header_align = @alignOf(Header);
             const key_align = if (@sizeOf(K) == 0) 1 else @alignOf(K);
             const val_align = if (@sizeOf(V) == 0) 1 else @alignOf(V);
             const max_align = comptime @max(header_align, key_align, val_align);
 
             const new_cap: usize = new_capacity;
-            // Include the final tombstone group
-            const meta_size = @sizeOf(Header) + (new_cap + Group.width) * @sizeOf(Metadata);
+            const meta_size = @sizeOf(Header) + new_cap * @sizeOf(Metadata);
             comptime assert(@alignOf(Metadata) == 1);
 
             const keys_start = std.mem.alignForward(usize, meta_size, key_align);
@@ -1482,8 +1501,7 @@ pub fn SwissHashMapUnmanaged(
             const max_align = comptime @max(header_align, key_align, val_align);
 
             const cap: usize = self.capacity();
-            // Account for the tombstone group here: vvvvvvvvvvvvv
-            const meta_size = @sizeOf(Header) + (cap + Group.width) * @sizeOf(Metadata);
+            const meta_size = @sizeOf(Header) + cap * @sizeOf(Metadata);
             comptime assert(@alignOf(Metadata) == 1);
 
             const keys_start = std.mem.alignForward(usize, meta_size, key_align);
@@ -1513,6 +1531,17 @@ pub fn SwissHashMapUnmanaged(
             if (!builtin.strip_debug_info) {
                 _ = &dbHelper;
             }
+        }
+
+        fn validate(self: Self) !void {
+            const cap = self.capacity();
+            const metadata = self.metadata orelse return;
+            var i: u32 = 0;
+            var counter: u32 = 0;
+            while (i < cap) : (i += 1) {
+                if (metadata[i].isUsed()) counter += 1;
+            }
+            try expectEqual(self.size, counter);
         }
 
         /// Helper debug function to view the keys nicely
@@ -1692,7 +1721,9 @@ test "clearRetainingCapacity" {
 
 // when it grows its still putting the elements in linear order and not quadratic (?)
 test "grow" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    const Map = AutoSwissHashMap(u32, u32);
+
+    var map = Map.init(std.testing.allocator);
     defer map.deinit();
 
     const growTo = 12456;
@@ -1702,8 +1733,6 @@ test "grow" {
         try map.put(i, i);
     }
     try expectEqual(growTo, map.count());
-
-    // std.debug.print("\n  <puts done>\n", .{});
 
     i = 0;
     var it = map.iterator();
