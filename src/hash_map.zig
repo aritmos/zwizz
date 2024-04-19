@@ -7,40 +7,340 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const Wyhash = std.hash.Wyhash;
 
-// Reuse functions and types from std/hash_map.zig
-const hash_map = std.hash_map;
-pub const getAutoHashFn = hash_map.getAutoHashFn;
-pub const getAutoEqlFn = hash_map.getAutoEqlFn;
-pub const AutoContext = hash_map.AutoContext;
-pub const StringContext = hash_map.StringContext;
-pub const eqlString = hash_map.eqlString;
-pub const hashString = hash_map.hashString;
-pub const StringIndexContext = hash_map.StringIndexContext;
-pub const StringIndexAdapter = hash_map.StringIndexAdapter;
-pub const verifyContext = hash_map.verifyContext;
+pub fn getAutoHashFn(comptime K: type, comptime Context: type) (fn (Context, K) u64) {
+    comptime {
+        assert(@hasDecl(std, "StringHashMap")); // detect when the following message needs updated
+        if (K == []const u8) {
+            @compileError("std.auto_hash.autoHash does not allow slices here (" ++
+                @typeName(K) ++
+                ") because the intent is unclear. " ++
+                "Consider using std.StringHashMap for hashing the contents of []const u8. " ++
+                "Alternatively, consider using std.auto_hash.hash or providing your own hash function instead.");
+        }
+    }
 
-pub fn AutoSwissHashMap(comptime K: type, comptime V: type) type {
-    return SwissHashMap(K, V, AutoContext(K), default_max_load_percentage);
+    return struct {
+        fn hash(ctx: Context, key: K) u64 {
+            _ = ctx;
+            if (std.meta.hasUniqueRepresentation(K)) {
+                return Wyhash.hash(0, std.mem.asBytes(&key));
+            } else {
+                var hasher = Wyhash.init(0);
+                autoHash(&hasher, key);
+                return hasher.final();
+            }
+        }
+    }.hash;
 }
 
-pub fn AutoSwissHashMapUnmanaged(comptime K: type, comptime V: type) type {
-    return SwissHashMapUnmanaged(K, V, AutoContext(K), default_max_load_percentage);
+pub fn getAutoEqlFn(comptime K: type, comptime Context: type) (fn (Context, K, K) bool) {
+    return struct {
+        fn eql(ctx: Context, a: K, b: K) bool {
+            _ = ctx;
+            return std.meta.eql(a, b);
+        }
+    }.eql;
+}
+
+pub fn AutoHashMap(comptime K: type, comptime V: type) type {
+    return HashMap(K, V, AutoContext(K), default_max_load_percentage);
+}
+
+pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type {
+    return HashMapUnmanaged(K, V, AutoContext(K), default_max_load_percentage);
+}
+
+pub fn AutoContext(comptime K: type) type {
+    return struct {
+        pub const hash = getAutoHashFn(K, @This());
+        pub const eql = getAutoEqlFn(K, @This());
+    };
 }
 
 /// Builtin hashmap for strings as keys.
 /// Key memory is managed by the caller.  Keys and values
 /// will not automatically be freed.
-pub fn StringSwissHashMap(comptime V: type) type {
-    return SwissHashMap([]const u8, V, StringContext, default_max_load_percentage);
+pub fn StringHashMap(comptime V: type) type {
+    return HashMap([]const u8, V, StringContext, default_max_load_percentage);
 }
 
 /// Key memory is managed by the caller.  Keys and values
 /// will not automatically be freed.
-pub fn StringSwissHashMapUnmanaged(comptime V: type) type {
-    return SwissHashMapUnmanaged([]const u8, V, StringContext, default_max_load_percentage);
+pub fn StringHashMapUnmanaged(comptime V: type) type {
+    return HashMapUnmanaged([]const u8, V, StringContext, default_max_load_percentage);
 }
 
+pub const StringContext = struct {
+    pub fn hash(self: @This(), s: []const u8) u64 {
+        _ = self;
+        return hashString(s);
+    }
+    pub fn eql(self: @This(), a: []const u8, b: []const u8) bool {
+        _ = self;
+        return eqlString(a, b);
+    }
+};
+
+pub fn eqlString(a: []const u8, b: []const u8) bool {
+    return mem.eql(u8, a, b);
+}
+
+pub fn hashString(s: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, s);
+}
+
+pub const StringIndexContext = struct {
+    bytes: *const std.ArrayListUnmanaged(u8),
+
+    pub fn eql(_: @This(), a: u32, b: u32) bool {
+        return a == b;
+    }
+
+    pub fn hash(ctx: @This(), key: u32) u64 {
+        return hashString(mem.sliceTo(ctx.bytes.items[key..], 0));
+    }
+};
+
+pub const StringIndexAdapter = struct {
+    bytes: *const std.ArrayListUnmanaged(u8),
+
+    pub fn eql(ctx: @This(), a: []const u8, b: u32) bool {
+        return mem.eql(u8, a, mem.sliceTo(ctx.bytes.items[b..], 0));
+    }
+
+    pub fn hash(_: @This(), adapted_key: []const u8) u64 {
+        assert(mem.indexOfScalar(u8, adapted_key, 0) == null);
+        return hashString(adapted_key);
+    }
+};
+
 pub const default_max_load_percentage = 80;
+
+/// This function issues a compile error with a helpful message if there
+/// is a problem with the provided context type.  A context must have the following
+/// member functions:
+///   - hash(self, PseudoKey) Hash
+///   - eql(self, PseudoKey, Key) bool
+///
+/// If you are passing a context to a *Adapted function, PseudoKey is the type
+/// of the key parameter.  Otherwise, when creating a HashMap or HashMapUnmanaged
+/// type, PseudoKey = Key = K.
+pub fn verifyContext(
+    comptime RawContext: type,
+    comptime PseudoKey: type,
+    comptime Key: type,
+    comptime Hash: type,
+    comptime is_array: bool,
+) void {
+    comptime {
+        var allow_const_ptr = false;
+        var allow_mutable_ptr = false;
+        // Context is the actual namespace type.  RawContext may be a pointer to Context.
+        var Context = RawContext;
+        // Make sure the context is a namespace type which may have member functions
+        switch (@typeInfo(Context)) {
+            .Struct, .Union, .Enum => {},
+            // Special-case .Opaque for a better error message
+            .Opaque => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context) ++ " because it is opaque.  Use a pointer instead."),
+            .Pointer => |ptr| {
+                if (ptr.size != .One) {
+                    @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context) ++ " because it is not a single pointer.");
+                }
+                Context = ptr.child;
+                allow_const_ptr = true;
+                allow_mutable_ptr = !ptr.is_const;
+                switch (@typeInfo(Context)) {
+                    .Struct, .Union, .Enum, .Opaque => {},
+                    else => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context)),
+                }
+            },
+            else => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context)),
+        }
+
+        // Keep track of multiple errors so we can report them all.
+        var errors: []const u8 = "";
+
+        // Put common errors here, they will only be evaluated
+        // if the error is actually triggered.
+        const lazy = struct {
+            const prefix = "\n  ";
+            const deep_prefix = prefix ++ "  ";
+            const hash_signature = "fn (self, " ++ @typeName(PseudoKey) ++ ") " ++ @typeName(Hash);
+            const index_param = if (is_array) ", b_index: usize" else "";
+            const eql_signature = "fn (self, " ++ @typeName(PseudoKey) ++ ", " ++
+                @typeName(Key) ++ index_param ++ ") bool";
+            const err_invalid_hash_signature = prefix ++ @typeName(Context) ++ ".hash must be " ++ hash_signature ++
+                deep_prefix ++ "but is actually " ++ @typeName(@TypeOf(Context.hash));
+            const err_invalid_eql_signature = prefix ++ @typeName(Context) ++ ".eql must be " ++ eql_signature ++
+                deep_prefix ++ "but is actually " ++ @typeName(@TypeOf(Context.eql));
+        };
+
+        // Verify Context.hash(self, PseudoKey) => Hash
+        if (@hasDecl(Context, "hash")) {
+            const hash = Context.hash;
+            const info = @typeInfo(@TypeOf(hash));
+            if (info == .Fn) {
+                const func = info.Fn;
+                if (func.params.len != 2) {
+                    errors = errors ++ lazy.err_invalid_hash_signature;
+                } else {
+                    var emitted_signature = false;
+                    if (func.params[0].type) |Self| {
+                        if (Self == Context) {
+                            // pass, this is always fine.
+                        } else if (Self == *const Context) {
+                            if (!allow_const_ptr) {
+                                if (!emitted_signature) {
+                                    errors = errors ++ lazy.err_invalid_hash_signature;
+                                    emitted_signature = true;
+                                }
+                                errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
+                                errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
+                            }
+                        } else if (Self == *Context) {
+                            if (!allow_mutable_ptr) {
+                                if (!emitted_signature) {
+                                    errors = errors ++ lazy.err_invalid_hash_signature;
+                                    emitted_signature = true;
+                                }
+                                if (!allow_const_ptr) {
+                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
+                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
+                                } else {
+                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ " or " ++ @typeName(*const Context) ++ ", but is " ++ @typeName(Self);
+                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be non-const because it is passed by const pointer.";
+                                }
+                            }
+                        } else {
+                            if (!emitted_signature) {
+                                errors = errors ++ lazy.err_invalid_hash_signature;
+                                emitted_signature = true;
+                            }
+                            errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context);
+                            if (allow_const_ptr) {
+                                errors = errors ++ " or " ++ @typeName(*const Context);
+                                if (allow_mutable_ptr) {
+                                    errors = errors ++ " or " ++ @typeName(*Context);
+                                }
+                            }
+                            errors = errors ++ ", but is " ++ @typeName(Self);
+                        }
+                    }
+                    if (func.params[1].type != null and func.params[1].type.? != PseudoKey) {
+                        if (!emitted_signature) {
+                            errors = errors ++ lazy.err_invalid_hash_signature;
+                            emitted_signature = true;
+                        }
+                        errors = errors ++ lazy.deep_prefix ++ "Second parameter must be " ++ @typeName(PseudoKey) ++ ", but is " ++ @typeName(func.params[1].type.?);
+                    }
+                    if (func.return_type != null and func.return_type.? != Hash) {
+                        if (!emitted_signature) {
+                            errors = errors ++ lazy.err_invalid_hash_signature;
+                            emitted_signature = true;
+                        }
+                        errors = errors ++ lazy.deep_prefix ++ "Return type must be " ++ @typeName(Hash) ++ ", but was " ++ @typeName(func.return_type.?);
+                    }
+                    // If any of these are generic (null), we cannot verify them.
+                    // The call sites check the return type, but cannot check the
+                    // parameters.  This may cause compile errors with generic hash/eql functions.
+                }
+            } else {
+                errors = errors ++ lazy.err_invalid_hash_signature;
+            }
+        } else {
+            errors = errors ++ lazy.prefix ++ @typeName(Context) ++ " must declare a pub hash function with signature " ++ lazy.hash_signature;
+        }
+
+        // Verify Context.eql(self, PseudoKey, Key) => bool
+        if (@hasDecl(Context, "eql")) {
+            const eql = Context.eql;
+            const info = @typeInfo(@TypeOf(eql));
+            if (info == .Fn) {
+                const func = info.Fn;
+                const args_len = if (is_array) 4 else 3;
+                if (func.params.len != args_len) {
+                    errors = errors ++ lazy.err_invalid_eql_signature;
+                } else {
+                    var emitted_signature = false;
+                    if (func.params[0].type) |Self| {
+                        if (Self == Context) {
+                            // pass, this is always fine.
+                        } else if (Self == *const Context) {
+                            if (!allow_const_ptr) {
+                                if (!emitted_signature) {
+                                    errors = errors ++ lazy.err_invalid_eql_signature;
+                                    emitted_signature = true;
+                                }
+                                errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
+                                errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
+                            }
+                        } else if (Self == *Context) {
+                            if (!allow_mutable_ptr) {
+                                if (!emitted_signature) {
+                                    errors = errors ++ lazy.err_invalid_eql_signature;
+                                    emitted_signature = true;
+                                }
+                                if (!allow_const_ptr) {
+                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
+                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
+                                } else {
+                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ " or " ++ @typeName(*const Context) ++ ", but is " ++ @typeName(Self);
+                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be non-const because it is passed by const pointer.";
+                                }
+                            }
+                        } else {
+                            if (!emitted_signature) {
+                                errors = errors ++ lazy.err_invalid_eql_signature;
+                                emitted_signature = true;
+                            }
+                            errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context);
+                            if (allow_const_ptr) {
+                                errors = errors ++ " or " ++ @typeName(*const Context);
+                                if (allow_mutable_ptr) {
+                                    errors = errors ++ " or " ++ @typeName(*Context);
+                                }
+                            }
+                            errors = errors ++ ", but is " ++ @typeName(Self);
+                        }
+                    }
+                    if (func.params[1].type.? != PseudoKey) {
+                        if (!emitted_signature) {
+                            errors = errors ++ lazy.err_invalid_eql_signature;
+                            emitted_signature = true;
+                        }
+                        errors = errors ++ lazy.deep_prefix ++ "Second parameter must be " ++ @typeName(PseudoKey) ++ ", but is " ++ @typeName(func.params[1].type.?);
+                    }
+                    if (func.params[2].type.? != Key) {
+                        if (!emitted_signature) {
+                            errors = errors ++ lazy.err_invalid_eql_signature;
+                            emitted_signature = true;
+                        }
+                        errors = errors ++ lazy.deep_prefix ++ "Third parameter must be " ++ @typeName(Key) ++ ", but is " ++ @typeName(func.params[2].type.?);
+                    }
+                    if (func.return_type.? != bool) {
+                        if (!emitted_signature) {
+                            errors = errors ++ lazy.err_invalid_eql_signature;
+                            emitted_signature = true;
+                        }
+                        errors = errors ++ lazy.deep_prefix ++ "Return type must be bool, but was " ++ @typeName(func.return_type.?);
+                    }
+                    // If any of these are generic (null), we cannot verify them.
+                    // The call sites check the return type, but cannot check the
+                    // parameters.  This may cause compile errors with generic hash/eql functions.
+                }
+            } else {
+                errors = errors ++ lazy.err_invalid_eql_signature;
+            }
+        } else {
+            errors = errors ++ lazy.prefix ++ @typeName(Context) ++ " must declare a pub eql function with signature " ++ lazy.eql_signature;
+        }
+
+        if (errors.len != 0) {
+            // errors begins with a newline (from lazy.prefix)
+            @compileError("Problems found with hash context type " ++ @typeName(Context) ++ ":" ++ errors);
+        }
+    }
+}
 
 /// General purpose hash table.
 /// No order is guaranteed and any modification invalidates live iterators.
@@ -57,7 +357,7 @@ pub const default_max_load_percentage = 80;
 /// take a pseudo key instead of a key.  Their context must have the functions:
 ///   hash(self, PseudoKey) u64
 ///   eql(self, PseudoKey, K) bool
-pub fn SwissHashMap(
+pub fn HashMap(
     comptime K: type,
     comptime V: type,
     comptime Context: type,
@@ -73,7 +373,7 @@ pub fn SwissHashMap(
         }
 
         /// The type of the unmanaged hash map underlying this wrapper
-        pub const Unmanaged = SwissHashMapUnmanaged(K, V, Context, max_load_percentage);
+        pub const Unmanaged = HashMapUnmanaged(K, V, Context, max_load_percentage);
         /// An entry, containing pointers to a key and value stored in the map
         pub const Entry = Unmanaged.Entry;
         /// A copy of a key and value which are no longer in the map
@@ -354,7 +654,7 @@ pub fn SwissHashMap(
         }
 
         /// Creates a copy of this map, using a specified context
-        pub fn cloneWithContext(self: Self, new_ctx: anytype) Allocator.Error!SwissHashMap(K, V, @TypeOf(new_ctx), max_load_percentage) {
+        pub fn cloneWithContext(self: Self, new_ctx: anytype) Allocator.Error!HashMap(K, V, @TypeOf(new_ctx), max_load_percentage) {
             var other = try self.unmanaged.cloneContext(self.allocator, new_ctx);
             return other.promoteContext(self.allocator, new_ctx);
         }
@@ -364,7 +664,7 @@ pub fn SwissHashMap(
             self: Self,
             new_allocator: Allocator,
             new_ctx: anytype,
-        ) Allocator.Error!SwissHashMap(K, V, @TypeOf(new_ctx), max_load_percentage) {
+        ) Allocator.Error!HashMap(K, V, @TypeOf(new_ctx), max_load_percentage) {
             var other = try self.unmanaged.cloneContext(new_allocator, new_ctx);
             return other.promoteContext(new_allocator, new_ctx);
         }
@@ -376,20 +676,10 @@ pub fn SwissHashMap(
             self.unmanaged = .{};
             return result;
         }
-
-        fn validate(self: Self) !void {
-            return self.unmanaged.validate();
-        }
-
-        /// Helper debug function to view the keys nicely
-        /// when using the testing allocator
-        fn printKeys(self: *Self) void {
-            return self.unmanaged.printKeys();
-        }
     };
 }
 
-/// A HashMap based on open addressing and grouped quadratic probing.
+/// A HashMap based on open addressing and linear probing.
 /// A lookup or modification typically incurs only 2 cache misses.
 /// No order is guaranteed and any modification invalidates live iterators.
 /// It achieves good performance with quite high load factors (by default,
@@ -398,7 +688,7 @@ pub fn SwissHashMap(
 /// the price of handling size with u32, which should be reasonable enough
 /// for almost all uses.
 /// Deletions are achieved with tombstones.
-pub fn SwissHashMapUnmanaged(
+pub fn HashMapUnmanaged(
     comptime K: type,
     comptime V: type,
     comptime Context: type,
@@ -432,21 +722,15 @@ pub fn SwissHashMapUnmanaged(
         /// `max_load_percentage`.
         available: Size = 0,
 
-        // This is updated when calling `allocate` (grow can be skipped, e.g. `clone`)
-        /// Number of groups in the probing sequence.
-        /// Equal to (capacity / group width)
-        num_groups: Size = 0,
-
         num_lookups: *u64 = undefined,
 
         pub fn init_lookups(self: *Self, ptr: *u64) void {
             self.num_lookups = ptr;
         }
 
-        // TODO: Make this equal to the group width
         // This is purely empirical and not a /very smart magic constant™/.
         /// Capacity of the first grow when bootstrapping the hashmap.
-        const minimal_capacity = 16;
+        const minimal_capacity = 8;
 
         // This hashmap is specially designed for sizes that fit in a u32.
         pub const Size = u32;
@@ -524,158 +808,12 @@ pub fn SwissHashMapUnmanaged(
                 self.used = 0;
                 self.fingerprint = tombstone;
             }
-
-            // used for debugging purposes
-            pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-                if (value.isFree()) {
-                    try writer.print("{s}", .{[_]u8{ ' ', ' ' }});
-                } else if (value.isTombstone()) {
-                    try writer.print("{s}", .{[_]u8{ 'T', 'T' }});
-                } else {
-                    try writer.print("{x:0>2}", .{@as(u8, @bitCast(value))});
-                }
-                return;
-            }
         };
 
         comptime {
             assert(@sizeOf(Metadata) == 1);
             assert(@alignOf(Metadata) == 1);
         }
-
-        /// A Metadata slice that is checked in parallel
-        pub const Group = struct {
-            // TODO: Make this selectable manually or automatically.
-            const width = 16;
-
-            comptime {
-                // TODO: Add more validation here
-                assert(math.isPowerOfTwo(width));
-            }
-
-            const u8s = @Vector(width, u8);
-            const i8s = @Vector(width, i8);
-
-            data: u8s,
-
-            pub fn init(ptr: [*]Metadata) @This() {
-                return .{ .data = @as([*]u8, @ptrCast(ptr))[0..width].* };
-            }
-
-            pub const BitMask = packed struct {
-                const mask_type = @Type(.{ .Int = .{
-                    .signedness = .unsigned,
-                    .bits = width,
-                } });
-
-                mask: mask_type,
-
-                const zero = @as(mask_type, 0);
-
-                /// Checks if there are any matches (if any bit is set).
-                inline fn hasMatch(self: @This()) bool {
-                    return self.mask != @This().zero;
-                }
-
-                /// Returns the index of the lowest set bit.
-                fn lowestSetBit(self: @This()) ?usize {
-                    if (!self.hasMatch()) {
-                        return null;
-                    }
-                    return @ctz(self.mask);
-                }
-
-                /// Removes the lowest set bit.
-                fn removeLowestBit(self: *@This()) void {
-                    self.mask &= self.mask - 1;
-                }
-
-                /// Iterator over the indices of set bits in a BitMask.
-                pub const Iterator = struct {
-                    mask: BitMask,
-
-                    fn next(self: *@This()) ?usize {
-                        if (self.mask.lowestSetBit()) |idx| {
-                            self.mask.removeLowestBit();
-                            return idx;
-                        }
-                        return null;
-                    }
-                };
-
-                fn iterator(self: @This()) @This().Iterator {
-                    return .{ .mask = self };
-                }
-
-                /// Helper function for debugging.
-                fn inner(self: @This()) mask_type {
-                    return @bitCast(self);
-                }
-
-                // used for debugging purposes
-                pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-                    return try writer.print("{b:0>16}", .{value.mask});
-                }
-            };
-
-            /// Creates a BitMask from matching bytes in the Group's Metadata slice.
-            fn matchByte(self: @This(), byte: u8) BitMask {
-                const cmp = @as(i8s, @splat(@bitCast(byte))) == @as(i8s, @bitCast(self.data));
-                return @as(BitMask, @bitCast(cmp));
-            }
-            fn hasByte(self: @This(), byte: u8) bool {
-                return self.matchByte(byte).hasMatch();
-            }
-
-            fn matchAvailable(self: @This()) BitMask {
-                const used: u8 = 0b10000000;
-                const cmp = @as(u8s, @splat(used)) > self.data;
-                return @as(BitMask, @bitCast(cmp));
-            }
-            fn hasAvailable(self: @This()) bool {
-                return self.matchAvailable().hasMatch();
-            }
-            fn getAvailable(self: @This()) ?usize {
-                return self.matchAvailable().lowestSetBit();
-            }
-
-            fn matchFree(self: @This()) BitMask {
-                return self.matchByte(Metadata.slot_free);
-            }
-            fn hasFree(self: @This()) bool {
-                return self.matchFree().hasMatch();
-            }
-            fn getFree(self: @This()) ?usize {
-                return self.matchFree().lowestSetBit();
-            }
-
-            fn matchFingerprint(self: @This(), fp: u7) BitMask {
-                const metadata = Metadata{
-                    .used = 1,
-                    .fingerprint = fp,
-                };
-                return self.matchByte(@as(u8, @bitCast(metadata)));
-            }
-            fn hasFingerprint(self: @This(), fp: u7) bool {
-                return self.matchFingerprint(fp).hasMatch();
-            }
-
-            fn matchTombstone(self: @This()) BitMask {
-                return self.matchByte(Metadata.slot_tombstone);
-            }
-            fn hasTombstone(self: @This()) bool {
-                return self.matchTombstone().hasMatch();
-            }
-            fn getTombstone(self: @This()) ?usize {
-                return self.matchByte(Metadata.slot_tombstone).lowestSetBit();
-            }
-
-            // used for debugging purposes
-            pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-                const metadata: [width]u8 = value.data;
-                return try writer.print("{any}", .{@as([width]Metadata, @bitCast(metadata))});
-            }
-        };
 
         pub const Iterator = struct {
             hm: *const Self,
@@ -736,7 +874,7 @@ pub fn SwissHashMapUnmanaged(
             found_existing: bool,
         };
 
-        pub const Managed = SwissHashMap(K, V, Context, max_load_percentage);
+        pub const Managed = HashMap(K, V, Context, max_load_percentage);
 
         pub fn promote(self: Self, allocator: Allocator) Managed {
             if (@sizeOf(Context) != 0)
@@ -764,8 +902,7 @@ pub fn SwissHashMapUnmanaged(
         fn capacityForSize(size: Size) Size {
             var new_cap: u32 = @intCast((@as(u64, size) * 100) / max_load_percentage + 1);
             new_cap = math.ceilPowerOfTwo(u32, new_cap) catch unreachable;
-            // Ensure we at least have one probable group
-            return @max(new_cap, Group.width);
+            return new_cap;
         }
 
         pub fn ensureTotalCapacity(self: *Self, allocator: Allocator, new_size: Size) Allocator.Error!void {
@@ -896,32 +1033,26 @@ pub fn SwissHashMapUnmanaged(
             assert(!self.containsContext(key, ctx));
 
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15; // ~ 0.00001
-            assert(self.num_groups > 0);
-            const mask = self.num_groups - 1;
-            var pos = @as(usize, @truncate(hash & mask));
-            var probe_len: u32 = 0;
+            const cond = @popCount(hash) == 15;
+            var probe_len: u32 = 1;
+            const mask = self.capacity() - 1;
+            var idx = @as(usize, @truncate(hash & mask));
 
-            var stride: u32 = 0;
-            var group = Group.init(self.metadata.? + pos * Group.width);
+            var metadata = self.metadata.? + idx;
             self.num_lookups.* += 1;
-            probe_len += 1;
-            while (!group.hasAvailable()) {
+            while (metadata[0].isUsed()) {
                 probe_len += 1;
-                stride += 1;
-                assert(stride < self.num_groups);
-                pos = (pos + stride) & mask;
-                group = Group.init(self.metadata.? + pos * Group.width);
+                idx = (idx + 1) & mask;
+                metadata = self.metadata.? + idx;
+                self.num_lookups.* += 1;
             }
 
             cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
-
             assert(self.available > 0);
             self.available -= 1;
 
             const fingerprint = Metadata.takeFingerprint(hash);
-            const idx = pos * Group.width + group.getAvailable().?;
-            (self.metadata.? + idx)[0].fill(fingerprint);
+            metadata[0].fill(fingerprint);
             self.keys()[idx] = key;
             self.values()[idx] = value;
 
@@ -1004,7 +1135,7 @@ pub fn SwissHashMapUnmanaged(
         /// fuse the basic blocks after the branch to the basic blocks
         /// from this function.  To encourage that, this function is
         /// marked as inline.
-        inline fn getIndex(self: Self, key: anytype, ctx: anytype) ?usize {
+        inline fn getIndex(self: *Self, key: anytype, ctx: anytype) ?usize {
             comptime verifyContext(@TypeOf(ctx), @TypeOf(key), K, Hash, false);
 
             if (self.size == 0) {
@@ -1014,43 +1145,24 @@ pub fn SwissHashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15; // ~ 0.00001
+            const cond = @popCount(hash) == 15;
+            var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
-
-            assert(self.num_groups > 0);
-            const mask = self.num_groups - 1; // bucket mask
+            const mask = self.capacity() - 1;
             const fingerprint = Metadata.takeFingerprint(hash);
-
             // Don't loop indefinitely when there are no empty slots.
-            var limit = self.num_groups;
-            var pos = @as(usize, @truncate(hash & mask));
-            var stride: u32 = 0;
+            var limit = self.capacity();
+            var idx = @as(usize, @truncate(hash & mask));
 
-            var probe_len: u32 = 1;
-            while (limit != 0) : ({
+            var metadata = self.metadata.? + idx;
+            self.num_lookups.* += 1;
+            while (!metadata[0].isFree() and limit != 0) {
                 probe_len += 1;
-                // WARNING: this continue block is dependant on the `continue` expression below
-                // if it is removed, then said expression also needs to be modified.
-                limit -= 1;
-                // TODO: remove limit and make the conditional the stride assertion?
-                // no `assert(stride < self.num_groups)` needed as this is covered by limit
-                stride += 1; // quadratic probing
-                pos = (pos + stride) & mask;
-            }) {
-                const group = Group.init(self.metadata.? + pos * Group.width);
-                self.num_lookups.* += 1;
-                const bitmask = group.matchFingerprint(fingerprint);
-                if (!bitmask.hasMatch()) {
-                    continue;
-                }
-                var iter = bitmask.iterator();
-                while (iter.next()) |bit| {
-                    // The real index of the bucket
-                    const idx = pos * Group.width + bit;
+                if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
                     const test_key = &self.keys()[idx];
                     // If you get a compile error on this line, it means that your generic eql
                     // function is invalid for these parameters.
@@ -1065,35 +1177,13 @@ pub fn SwissHashMapUnmanaged(
                     }
                 }
 
-                if (group.hasFree()) break;
+                limit -= 1;
+                idx = (idx + 1) & mask;
+                metadata = self.metadata.? + idx;
+                self.num_lookups.* += 1;
             }
+
             cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
-            return null;
-        }
-
-        /// Helper function for debugging.
-        inline fn getIndexLinear(self: Self, key: anytype, ctx: anytype) ?usize {
-            const hash = ctx.hash(key);
-
-            const mask = self.capacity() - 1; // bucket mask
-            const fingerprint = Metadata.takeFingerprint(hash);
-
-            // Don't loop indefinitely when there are no empty slots.
-
-            var i: u32 = 0;
-            while (i <= mask) : (i += 1) {
-                var metadata = self.metadata.?[i];
-
-                if (!metadata.isUsed() or metadata.fingerprint != fingerprint) {
-                    continue;
-                }
-                const test_key = &self.keys()[i];
-                const eql = ctx.eql(key, test_key.*);
-                if (eql) {
-                    return i;
-                }
-            }
-
             return null;
         }
 
@@ -1240,70 +1330,63 @@ pub fn SwissHashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15; // ~ 0.00001
+            const cond = @popCount(hash) == 15;
             var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
-
-            assert(self.num_groups > 0);
-            const mask = self.num_groups - 1;
+            const mask = self.capacity() - 1;
             const fingerprint = Metadata.takeFingerprint(hash);
-
-            var limit = self.num_groups;
-            var pos = @as(usize, @truncate(hash & mask));
-            var stride: u32 = 0;
+            var limit = self.capacity();
+            var idx = @as(usize, @truncate(hash & mask));
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
-            var group = Group.init(self.metadata.? + pos * Group.width);
+            var metadata = self.metadata.? + idx;
             self.num_lookups.* += 1;
-            while (limit != 0) : ({
+            while (!metadata[0].isFree() and limit != 0) {
                 probe_len += 1;
-                limit -= 1;
-                stride += 1; // quadratic probing
-                // Assertion not needed due to `limit` giving the same bound
-                // TODO: remove limit?
-                // assert(stride < self.num_groups);
-                pos = (pos + stride) & mask;
-                group = Group.init(self.metadata.? + pos * Group.width);
-                self.num_lookups.* += 1;
-            }) {
-                const bit_mask = group.matchFingerprint(fingerprint);
-                if (bit_mask.hasMatch()) {
-                    var iter = bit_mask.iterator();
-                    while (iter.next()) |bit| {
-                        const idx = pos * Group.width + bit;
-                        const test_key = &self.keys()[idx];
-                        // If you get a compile error on this line, it means that your generic eql
-                        // function is invalid for these parameters.
-                        const eql = ctx.eql(key, test_key.*);
-                        // verifyContext can't verify the return type of generic eql functions,
-                        // so we need to double-check it here.
-                        if (@TypeOf(eql) != bool) {
-                            @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
-                        }
-                        if (eql) {
-                            return GetOrPutResult{
-                                .key_ptr = test_key,
-                                .value_ptr = &self.values()[idx],
-                                .found_existing = true,
-                            };
-                        }
+                if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
+                    const test_key = &self.keys()[idx];
+                    // If you get a compile error on this line, it means that your generic eql
+                    // function is invalid for these parameters.
+                    const eql = ctx.eql(key, test_key.*);
+                    // verifyContext can't verify the return type of generic eql functions,
+                    // so we need to double-check it here.
+                    if (@TypeOf(eql) != bool) {
+                        @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                     }
-                } else if (first_tombstone_idx == self.capacity()) {
-                    if (group.getTombstone()) |bit| first_tombstone_idx = pos * Group.width + bit;
+                    if (eql) {
+                        cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
+                        return GetOrPutResult{
+                            .key_ptr = test_key,
+                            .value_ptr = &self.values()[idx],
+                            .found_existing = true,
+                        };
+                    }
+                } else if (first_tombstone_idx == self.capacity() and metadata[0].isTombstone()) {
+                    first_tombstone_idx = idx;
                 }
 
-                if (group.hasFree()) break;
+                limit -= 1;
+                idx = (idx + 1) & mask;
+                metadata = self.metadata.? + idx;
+                self.num_lookups.* += 1;
             }
+
+            if (first_tombstone_idx < self.capacity()) {
+                // Cheap try to lower probing lengths after deletions. Recycle a tombstone.
+                idx = first_tombstone_idx;
+                metadata = self.metadata.? + idx;
+            }
+
             cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
 
-            const idx = if (group.getFree()) |bit| @min(pos * Group.width + bit, first_tombstone_idx) else first_tombstone_idx;
             // We're using a slot previously free or a tombstone.
             self.available -= 1;
-            self.metadata.?[idx].fill(fingerprint);
+
+            metadata[0].fill(fingerprint);
             const new_key = &self.keys()[idx];
             const new_value = &self.values()[idx];
             new_key.* = undefined;
@@ -1332,15 +1415,15 @@ pub fn SwissHashMapUnmanaged(
         }
 
         /// Return true if there is a value associated with key in the map.
-        pub fn contains(self: *const Self, key: K) bool {
+        pub fn contains(self: *Self, key: K) bool {
             if (@sizeOf(Context) != 0)
                 @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call containsContext instead.");
             return self.containsContext(key, undefined);
         }
-        pub fn containsContext(self: *const Self, key: K, ctx: Context) bool {
+        pub fn containsContext(self: *Self, key: K, ctx: Context) bool {
             return self.containsAdapted(key, ctx);
         }
-        pub fn containsAdapted(self: *const Self, key: anytype, ctx: anytype) bool {
+        pub fn containsAdapted(self: *Self, key: anytype, ctx: anytype) bool {
             return self.getIndex(key, ctx) != null;
         }
 
@@ -1389,9 +1472,7 @@ pub fn SwissHashMapUnmanaged(
         }
 
         fn initMetadatas(self: *Self) void {
-            const end = @sizeOf(Metadata) * self.capacity();
-            // Set all Metadatas to Free
-            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0..end], Metadata.slot_free);
+            @memset(@as([*]u8, @ptrCast(self.metadata.?))[0 .. @sizeOf(Metadata) * self.capacity()], 0);
         }
 
         // This counts the number of occupied slots (not counting tombstones), which is
@@ -1413,8 +1494,8 @@ pub fn SwissHashMapUnmanaged(
                 @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call cloneContext instead.");
             return self.cloneContext(allocator, @as(Context, undefined));
         }
-        pub fn cloneContext(self: Self, allocator: Allocator, new_ctx: anytype) Allocator.Error!SwissHashMapUnmanaged(K, V, @TypeOf(new_ctx), max_load_percentage) {
-            var other = SwissHashMapUnmanaged(K, V, @TypeOf(new_ctx), max_load_percentage){};
+        pub fn cloneContext(self: Self, allocator: Allocator, new_ctx: anytype) Allocator.Error!HashMapUnmanaged(K, V, @TypeOf(new_ctx), max_load_percentage) {
+            var other = HashMapUnmanaged(K, V, @TypeOf(new_ctx), max_load_percentage){};
             if (self.size == 0)
                 return other;
 
@@ -1434,7 +1515,6 @@ pub fn SwissHashMapUnmanaged(
                         break;
                 }
             }
-            assert(other.size == self.size);
 
             return other;
         }
@@ -1473,7 +1553,6 @@ pub fn SwissHashMapUnmanaged(
                             break;
                     }
                 }
-                assert(map.size == self.size);
             }
 
             self.size = 0;
@@ -1481,9 +1560,6 @@ pub fn SwissHashMapUnmanaged(
         }
 
         fn allocate(self: *Self, allocator: Allocator, new_capacity: Size) Allocator.Error!void {
-            assert(math.isPowerOfTwo(new_capacity));
-            self.num_groups = new_capacity / Group.width;
-
             const header_align = @alignOf(Header);
             const key_align = if (@sizeOf(K) == 0) 1 else @alignOf(K);
             const val_align = if (@sizeOf(V) == 0) 1 else @alignOf(V);
@@ -1557,40 +1633,6 @@ pub fn SwissHashMapUnmanaged(
                 _ = &dbHelper;
             }
         }
-
-        fn validate(self: Self) !void {
-            const cap = self.capacity();
-            const metadata = self.metadata orelse return;
-            var i: u32 = 0;
-            var counter: u32 = 0;
-            while (i < cap) : (i += 1) {
-                if (metadata[i].isUsed()) counter += 1;
-            }
-            try expectEqual(self.size, counter);
-        }
-
-        /// Helper debug function to view the keys nicely
-        /// when using the testing allocator
-        fn printKeys(self: *Self) void {
-            // not possible: assert(self.allocator == std.testing.allocator);
-            const keys_ = self.header().keys[0 .. math.ceilPowerOfTwo(u32, self.capacity()) catch unreachable];
-            const formatted_keys = @as([]Key(K), @ptrCast(keys_));
-            std.debug.print("KK{any}\n", .{formatted_keys});
-        }
-    };
-}
-
-fn Key(key: type) type {
-    return struct {
-        val: key,
-
-        pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-            if (value.val == 2863311530) {
-                try writer.print("  ", .{});
-            } else {
-                try writer.print("{: >2}", .{value.val});
-            }
-        }
     };
 }
 
@@ -1602,71 +1644,8 @@ fn cprint(expr: bool, comptime fmt: []const u8, args: anytype) void {
     if (expr) std.debug.print(fmt, args);
 }
 
-// zwizz tests
-// test "zwizz test" {
-//     const Metadata = AutoSwissHashMap(u32, u32).Unmanaged.Metadata;
-//     const metadata: Metadata = .{
-//         .used = 1,
-//         .fingerprint = 0,
-//     };
-//     std.debug.print("\n{}\n", .{@as(u8, @bitCast(metadata))});
-// }
-test "zwizz basic" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
-    defer map.deinit();
-
-    const count = 5;
-    var i: u32 = 1;
-    while (i < count) : (i += 2) {
-        try map.put(i, i);
-    }
-
-    var iter = map.valueIterator();
-    try expectEqual(iter.next().?.*, @as(u32, 1));
-    try expectEqual(iter.next().?.*, @as(u32, 3));
-    try expectEqual(iter.next(), null);
-}
-test "zwizz groups" {
-    const Unmanaged = AutoSwissHashMap(u32, u32).Unmanaged;
-    const Metadata = Unmanaged.Metadata;
-    const Group = Unmanaged.Group;
-
-    const b: u8 = 0x0a;
-    const arr: [16]u8 = [_]u8{ 0, 0, 0, 0, 0, 0, b, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
-    const metadata = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
-    var group = Group.init(metadata);
-
-    const match = group.matchByte(b);
-    try expectEqual(match.hasMatch(), true);
-    var iter = match.iterator();
-    try expectEqual(iter.next().?, 6);
-    try expectEqual(iter.next(), null);
-}
-// test "zwizz core" {
-//     const Map = AutoSwissHashMap(u32, u32);
-//     const U = Map.Unmanaged;
-//     var map = Map.init(std.testing.allocator);
-//     defer map.deinit();
-//
-//     try map.put(1, 1);
-//     std.debug.print("{any}\n", .{@as([*]u8, @ptrCast(map.unmanaged.metadata.?))[0 .. map.capacity() + Map.Unmanaged.Group.width]});
-//
-//     const hash = AutoContext(u32).hash(undefined, 1);
-//     std.debug.print("hash: {any}\n", .{hash});
-//
-//     std.debug.print("fingerprint: {any}\n", .{U.Metadata.takeFingerprint(hash)});
-//
-//     const mask = map.capacity() - 1;
-//     const idx = @as(usize, @truncate(hash & mask));
-//
-//     std.debug.print("index: {any}\n", .{idx});
-//     std.debug.print("metadata: {any}\n", .{map.unmanaged.metadata.?[idx]});
-// }
-
-// original tests
 test "basic usage" {
-    // std.debug.print("\n", .{});
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     const count = 5;
@@ -1687,13 +1666,14 @@ test "basic usage" {
     i = 0;
     sum = 0;
     while (i < count) : (i += 1) {
+        try expectEqual(i, map.get(i).?);
         sum += map.get(i).?;
     }
     try expectEqual(total, sum);
 }
 
 test "ensureTotalCapacity" {
-    var map = AutoSwissHashMap(i32, i32).init(std.testing.allocator);
+    var map = AutoHashMap(i32, i32).init(std.testing.allocator);
     defer map.deinit();
 
     try map.ensureTotalCapacity(20);
@@ -1708,7 +1688,7 @@ test "ensureTotalCapacity" {
 }
 
 test "ensureUnusedCapacity with tombstones" {
-    var map = AutoSwissHashMap(i32, i32).init(std.testing.allocator);
+    var map = AutoHashMap(i32, i32).init(std.testing.allocator);
     defer map.deinit();
 
     var i: i32 = 0;
@@ -1720,7 +1700,7 @@ test "ensureUnusedCapacity with tombstones" {
 }
 
 test "clearRetainingCapacity" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     map.clearRetainingCapacity();
@@ -1744,11 +1724,8 @@ test "clearRetainingCapacity" {
     try expect(!map.contains(1));
 }
 
-// when it grows its still putting the elements in linear order and not quadratic (?)
 test "grow" {
-    const Map = AutoSwissHashMap(u32, u32);
-
-    var map = Map.init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     const growTo = 12456;
@@ -1757,7 +1734,7 @@ test "grow" {
     while (i < growTo) : (i += 1) {
         try map.put(i, i);
     }
-    try expectEqual(growTo, map.count());
+    try expectEqual(map.count(), growTo);
 
     i = 0;
     var it = map.iterator();
@@ -1767,20 +1744,14 @@ test "grow" {
     }
     try expectEqual(i, growTo);
 
-    // std.debug.print("\n  <iter done>\n", .{});
-
-    // const idx = map.unmanaged.getIndexLinear(861, map.ctx);
-    // std.debug.print("861@{any}\n", .{idx});
-
-    i = 860;
+    i = 0;
     while (i < growTo) : (i += 1) {
-        // std.debug.print("getting {}\n", .{i});
         try expectEqual(map.get(i).?, i);
     }
 }
 
 test "clone" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var a = try map.clone();
@@ -1800,7 +1771,7 @@ test "clone" {
     try expectEqual(b.get(2).?, 2);
     try expectEqual(b.get(3).?, 3);
 
-    var original = AutoSwissHashMap(i32, i32).init(std.testing.allocator);
+    var original = AutoHashMap(i32, i32).init(std.testing.allocator);
     defer original.deinit();
 
     var i: u8 = 0;
@@ -1818,7 +1789,7 @@ test "clone" {
 }
 
 test "ensureTotalCapacity with existing elements" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     try map.put(0, 0);
@@ -1831,7 +1802,7 @@ test "ensureTotalCapacity with existing elements" {
 }
 
 test "ensureTotalCapacity satisfies max load factor" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     try map.ensureTotalCapacity(127);
@@ -1839,7 +1810,7 @@ test "ensureTotalCapacity satisfies max load factor" {
 }
 
 test "remove" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var i: u32 = 0;
@@ -1871,7 +1842,7 @@ test "remove" {
 }
 
 test "reverse removes" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var i: u32 = 0;
@@ -1893,7 +1864,7 @@ test "reverse removes" {
 }
 
 test "multiple removes on same metadata" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var i: u32 = 0;
@@ -1930,7 +1901,7 @@ test "multiple removes on same metadata" {
 }
 
 test "put and remove loop in random order" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var keys = std.ArrayList(u32).init(std.testing.allocator);
@@ -1962,7 +1933,7 @@ test "put and remove loop in random order" {
 }
 
 test "remove one million elements in random order" {
-    const Map = AutoSwissHashMap(u32, u32);
+    const Map = AutoHashMap(u32, u32);
     const n = 1000 * 1000;
     var map = Map.init(std.heap.page_allocator);
     defer map.deinit();
@@ -1991,36 +1962,33 @@ test "remove one million elements in random order" {
     }
 }
 
-// This test will fail as it checks the linear probing in the std implementation
-// TODO: Replace it with the equivalent in the quadratic probing case
-//
-// test "put" {
-//     var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
-//     defer map.deinit();
-//
-//     var i: u32 = 0;
-//     while (i < 16) : (i += 1) {
-//         try map.put(i, i);
-//     }
-//
-//     i = 0;
-//     while (i < 16) : (i += 1) {
-//         try expectEqual(map.get(i).?, i);
-//     }
-//
-//     i = 0;
-//     while (i < 16) : (i += 1) {
-//         try map.put(i, i * 16 + 1);
-//     }
-//
-//     i = 0;
-//     while (i < 16) : (i += 1) {
-//         try expectEqual(map.get(i).?, i * 16 + 1);
-//     }
-// }
+test "put" {
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
+    defer map.deinit();
+
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        try map.put(i, i);
+    }
+
+    i = 0;
+    while (i < 16) : (i += 1) {
+        try expectEqual(map.get(i).?, i);
+    }
+
+    i = 0;
+    while (i < 16) : (i += 1) {
+        try map.put(i, i * 16 + 1);
+    }
+
+    i = 0;
+    while (i < 16) : (i += 1) {
+        try expectEqual(map.get(i).?, i * 16 + 1);
+    }
+}
 
 test "putAssumeCapacity" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     try map.ensureTotalCapacity(20);
@@ -2034,7 +2002,7 @@ test "putAssumeCapacity" {
     while (i < 20) : (i += 1) {
         sum += map.getPtr(i).?.*;
     }
-    try expectEqual(190, sum);
+    try expectEqual(sum, 190);
 
     i = 0;
     while (i < 20) : (i += 1) {
@@ -2046,42 +2014,32 @@ test "putAssumeCapacity" {
     while (i < 20) : (i += 1) {
         sum += map.get(i).?;
     }
-
-    try expectEqual(20, sum);
+    try expectEqual(sum, 20);
 }
 
 test "repeat putAssumeCapacity/remove" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     try map.ensureTotalCapacity(20);
     const limit = map.unmanaged.available;
-    // std.debug.print("\nlimit = {}, capacity = {}\n", .{ limit, map.unmanaged.capacity() });
-    // std.debug.print("\ninitial put\n", .{});
 
     var i: u32 = 0;
     while (i < limit) : (i += 1) {
         map.putAssumeCapacityNoClobber(i, i);
     }
 
-    // cprint(true, "DONE\n", .{});
-    // map.printKeys();
-    // cprint(true, "---\n", .{});
-
     // Repeatedly delete/insert an entry without resizing the map.
     // Put to different keys so entries don't land in the just-freed slot.
     i = 0;
     while (i < 10 * limit) : (i += 1) {
         try testing.expect(map.remove(i));
-        // cprint(limit + i == 70, "STARTING KEY=70 (VAL = {})\n", .{i});
         if (i % 2 == 0) {
             map.putAssumeCapacityNoClobber(limit + i, i);
         } else {
             map.putAssumeCapacity(limit + i, i);
         }
     }
-
-    std.debug.print("pre get\n", .{});
 
     i = 9 * limit;
     while (i < 10 * limit) : (i += 1) {
@@ -2092,7 +2050,7 @@ test "repeat putAssumeCapacity/remove" {
 }
 
 test "getOrPut" {
-    var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
     var i: u32 = 0;
@@ -2115,7 +2073,7 @@ test "getOrPut" {
 }
 
 test "basic hash map usage" {
-    var map = AutoSwissHashMap(i32, i32).init(std.testing.allocator);
+    var map = AutoHashMap(i32, i32).init(std.testing.allocator);
     defer map.deinit();
 
     try testing.expect((try map.fetchPut(1, 11)) == null);
@@ -2161,17 +2119,17 @@ test "basic hash map usage" {
 
 test "getOrPutAdapted" {
     const AdaptedContext = struct {
-        pub fn eql(self: @This(), adapted_key: []const u8, test_key: u64) bool {
+        fn eql(self: @This(), adapted_key: []const u8, test_key: u64) bool {
             _ = self;
             return std.fmt.parseInt(u64, adapted_key, 10) catch unreachable == test_key;
         }
-        pub fn hash(self: @This(), adapted_key: []const u8) u64 {
+        fn hash(self: @This(), adapted_key: []const u8) u64 {
             _ = self;
             const key = std.fmt.parseInt(u64, adapted_key, 10) catch unreachable;
             return (AutoContext(u64){}).hash(key);
         }
     };
-    var map = AutoSwissHashMap(u64, u64).init(testing.allocator);
+    var map = AutoHashMap(u64, u64).init(testing.allocator);
     defer map.deinit();
 
     const keys = [_][]const u8{
@@ -2209,7 +2167,7 @@ test "getOrPutAdapted" {
 }
 
 test "ensureUnusedCapacity" {
-    var map = AutoSwissHashMap(u64, u64).init(testing.allocator);
+    var map = AutoHashMap(u64, u64).init(testing.allocator);
     defer map.deinit();
 
     try map.ensureUnusedCapacity(32);
@@ -2222,7 +2180,7 @@ test "ensureUnusedCapacity" {
 }
 
 test "removeByPtr" {
-    var map = AutoSwissHashMap(i32, u64).init(testing.allocator);
+    var map = AutoHashMap(i32, u64).init(testing.allocator);
     defer map.deinit();
 
     var i: i32 = undefined;
@@ -2248,7 +2206,7 @@ test "removeByPtr" {
 }
 
 test "removeByPtr 0 sized key" {
-    var map = AutoSwissHashMap(u0, u64).init(testing.allocator);
+    var map = AutoHashMap(u0, u64).init(testing.allocator);
     defer map.deinit();
 
     try map.put(0, 0);
@@ -2266,7 +2224,7 @@ test "removeByPtr 0 sized key" {
 }
 
 test "repeat fetchRemove" {
-    var map = AutoSwissHashMapUnmanaged(u64, void){};
+    var map = AutoHashMapUnmanaged(u64, void){};
     defer map.deinit(testing.allocator);
 
     try map.ensureTotalCapacity(testing.allocator, 4);
