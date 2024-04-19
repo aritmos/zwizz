@@ -3,8 +3,8 @@ const swiss = @import("swiss_hash_map.zig");
 const hm = @import("hash_map.zig");
 
 pub fn main() !void {
-    const l = lookups(hm.AutoHashMap(u32, u32));
-    // const l = lookups(swiss.AutoSwissHashMap(u32, u32));
+    // const l = lookups(hm.AutoHashMap(u32, u32));
+    const l = lookups(swiss.AutoSwissHashMap(u32, u32));
     std.debug.print("{}\n", .{l});
 }
 

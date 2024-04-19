@@ -7,6 +7,8 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const Wyhash = std.hash.Wyhash;
 
+const testProbeLen = false;
+
 pub fn getAutoHashFn(comptime K: type, comptime Context: type) (fn (Context, K) u64) {
     comptime {
         assert(@hasDecl(std, "StringHashMap")); // detect when the following message needs updated
@@ -1033,7 +1035,7 @@ pub fn HashMapUnmanaged(
             assert(!self.containsContext(key, ctx));
 
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15;
+            const cond = @popCount(hash) == 15 and testProbeLen;
             var probe_len: u32 = 1;
             const mask = self.capacity() - 1;
             var idx = @as(usize, @truncate(hash & mask));
@@ -1145,7 +1147,7 @@ pub fn HashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15;
+            const cond = @popCount(hash) == 15 and testProbeLen;
             var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
@@ -1330,7 +1332,7 @@ pub fn HashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15;
+            const cond = @popCount(hash) == 15 and testProbeLen;
             var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
