@@ -437,8 +437,23 @@ pub fn SwissHashMapUnmanaged(
         // [DEBUG] Used to the track total number of lookups of a map
         num_lookups: ?*u64 = null,
 
-        pub fn init_lookups(self: *Self, ptr: ?*u64) void {
+        // [DEBUG]
+        probe_len: ?*u64 = null,
+
+        pub fn initLookups(self: *Self, ptr: ?*u64) void {
             self.num_lookups = ptr;
+        }
+
+        pub fn initProbeLen(self: *Self, ptr: ?*u64) void {
+            self.probe_len = ptr;
+        }
+
+        pub fn getProbeLen(self: Self) ?u64 {
+            return if (self.probe_len) |p| p.* else null;
+        }
+
+        pub fn resetProbeLen(self: Self) void {
+            if (self.probe_len) |p| p.* = 0;
         }
 
         // TODO: Make this equal to the group width
@@ -589,9 +604,8 @@ pub fn SwissHashMapUnmanaged(
 
                 /// Returns the index of the lowest set bit.
                 fn lowestSetBit(self: @This()) ?usize {
-                    if (!self.hasMatch()) {
+                    if (!self.hasMatch())
                         return null;
-                    }
                     return @ctz(self.mask);
                 }
 
@@ -630,7 +644,7 @@ pub fn SwissHashMapUnmanaged(
 
             /// Creates a BitMask from matching bytes in the Group's Metadata slice.
             fn matchByte(self: @This(), byte: u8) BitMask {
-                const cmp = @as(i8s, @splat(@bitCast(byte))) == @as(i8s, @bitCast(self.data));
+                const cmp = @as(u8s, @splat(@bitCast(byte))) == self.data;
                 return @as(BitMask, @bitCast(cmp));
             }
             fn hasByte(self: @This(), byte: u8) bool {
@@ -638,7 +652,7 @@ pub fn SwissHashMapUnmanaged(
             }
 
             fn matchAvailable(self: @This()) BitMask {
-                const used: u8 = 0b10000000;
+                const used = comptime @as(u8, @bitCast(Metadata{ .used = 1 }));
                 const cmp = @as(u8s, @splat(used)) > self.data;
                 return @as(BitMask, @bitCast(cmp));
             }
@@ -686,6 +700,13 @@ pub fn SwissHashMapUnmanaged(
                 return try writer.print("{any}", .{@as([width]Metadata, @bitCast(metadata))});
             }
         };
+
+        /// [DEBUG] Initialises a Group and updates DEBUG parameters
+        fn initGroup(self: Self, ptr: [*]Metadata) Group {
+            if (self.num_lookups) |p| p.* += 1;
+            if (self.probe_len) |p| p.* += 1;
+            return Group.init(ptr);
+        }
 
         pub const Iterator = struct {
             hm: *const Self,
@@ -905,31 +926,28 @@ pub fn SwissHashMapUnmanaged(
             assert(!self.containsContext(key, ctx));
 
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15 and testProbeLen; // ~ 0.00001
+
+            defer self.resetProbeLen();
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
+
             const mask = self.capacity() - 1;
             var pos = @as(usize, @truncate(hash & mask));
-            var probe_len: u32 = 0;
 
             var stride: u32 = 0;
-            var group = Group.init(self.metadata.? + pos);
-            self.num_lookups.?.* += 1;
-            probe_len += 1;
+            var group = self.initGroup(self.metadata.? + pos);
             while (!group.hasAvailable()) {
-                probe_len += 1;
                 stride += 1;
                 assert(stride < mask + 1);
                 pos = (pos + stride * Group.width) & mask;
-                group = Group.init(self.metadata.? + pos);
-                self.num_lookups.?.* += 1;
+                group = self.initGroup(self.metadata.? + pos);
             }
-
-            cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
 
             assert(self.available > 0);
             self.available -= 1;
 
             const fingerprint = Metadata.takeFingerprint(hash);
             const idx = (pos + group.getAvailable().?) & mask;
+            std.debug.print("{} {} (pACNCC)\n", .{ key, idx });
             self.fillMetadata(idx, fingerprint);
             self.keys()[idx] = key;
             self.values()[idx] = value;
@@ -1023,12 +1041,15 @@ pub fn SwissHashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15 and testProbeLen; // ~ 0.00001
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
+
+            defer self.resetProbeLen();
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
+            var idx: u64 = 0;
 
             const mask = self.capacity() - 1; // bucket mask
             const fingerprint = Metadata.takeFingerprint(hash);
@@ -1038,9 +1059,7 @@ pub fn SwissHashMapUnmanaged(
             var pos = @as(usize, @truncate(hash & mask));
             var stride: u32 = 0;
 
-            var probe_len: u32 = 1;
             while (limit != 0) : ({
-                probe_len += 1;
                 // WARNING: this continue block is dependant on the `continue` expression below
                 // if it is removed, then said expression also needs to be modified.
                 limit -= 1;
@@ -1049,16 +1068,12 @@ pub fn SwissHashMapUnmanaged(
                 stride += 1; // quadratic probing
                 pos = (pos + stride * Group.width) & mask;
             }) {
-                const group = Group.init(self.metadata.? + pos);
-                self.num_lookups.?.* += 1;
+                const group = self.initGroup(self.metadata.? + pos);
                 const bitmask = group.matchFingerprint(fingerprint);
-                if (!bitmask.hasMatch()) {
-                    continue;
-                }
                 var iter = bitmask.iterator();
                 while (iter.next()) |bit| {
                     // The real index of the bucket
-                    const idx = (pos + bit) & mask;
+                    idx = (pos + bit) & mask;
                     const test_key = &self.keys()[idx];
                     // If you get a compile error on this line, it means that your generic eql
                     // function is invalid for these parameters.
@@ -1069,13 +1084,14 @@ pub fn SwissHashMapUnmanaged(
                         @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                     }
                     if (eql) {
+                        std.debug.print("{} {} (gI)\n", .{ key, idx });
                         return idx & mask;
                     }
                 }
 
                 if (group.hasFree()) break;
             }
-            cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
+            std.debug.print("{} null (gI)\n", .{key});
             return null;
         }
 
@@ -1248,13 +1264,15 @@ pub fn SwissHashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15 and testProbeLen; // ~ 0.00001
-            var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
                 @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic hash function that returns the wrong type! " ++ @typeName(Hash) ++ " was expected, but found " ++ @typeName(@TypeOf(hash)));
             }
+
+            defer self.resetProbeLen();
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
+            var idx: u64 = 0;
 
             const mask = self.capacity() - 1;
             const fingerprint = Metadata.takeFingerprint(hash);
@@ -1263,22 +1281,19 @@ pub fn SwissHashMapUnmanaged(
             var pos = @as(usize, @truncate(hash & mask));
             var stride: u32 = 0;
 
-            var first_tombstone_idx: usize = self.capacity() + Group.width; // invalid index
-            var group = Group.init(self.metadata.? + pos);
-            self.num_lookups.?.* += 1;
+            var first_available_idx: usize = self.capacity() + Group.width; // invalid index
+            var group = self.initGroup(self.metadata.? + pos);
             while (limit != 0) : ({
-                probe_len += 1;
                 limit -= 1;
                 stride += 1; // quadratic probing
                 pos = (pos + stride * Group.width) & mask;
-                group = Group.init(self.metadata.? + pos);
-                self.num_lookups.?.* += 1;
+                group = self.initGroup(self.metadata.? + pos);
             }) {
                 const bitmask = group.matchFingerprint(fingerprint);
                 if (bitmask.hasMatch()) {
                     var iter = bitmask.iterator();
                     while (iter.next()) |bit| {
-                        const idx = (pos + bit) & mask;
+                        idx = (pos + bit) & mask;
                         const test_key = &self.keys()[idx];
                         // If you get a compile error on this line, it means that your generic eql
                         // function is invalid for these parameters.
@@ -1289,7 +1304,7 @@ pub fn SwissHashMapUnmanaged(
                             @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                         }
                         if (eql) {
-                            // std.debug.print(" put at idx={} (eq)\n", .{idx});
+                            std.debug.print("{} {} (gOPACA eq)\n", .{ key, idx });
                             return GetOrPutResult{
                                 .key_ptr = test_key,
                                 .value_ptr = &self.values()[idx],
@@ -1298,22 +1313,15 @@ pub fn SwissHashMapUnmanaged(
                         }
                     }
                 }
-                if (first_tombstone_idx == self.capacity() + Group.width) {
-                    if (group.getTombstone()) |bit| first_tombstone_idx = (pos + bit) & mask;
+                if (first_available_idx == self.capacity() + Group.width) {
+                    if (group.getAvailable()) |bit| first_available_idx = (pos + bit) & mask;
                 }
 
                 if (group.hasFree()) break;
             }
-            cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
 
-            const idx = (if (group.getFree()) |bit| @min(pos + bit, first_tombstone_idx) else first_tombstone_idx) & mask;
-            // std.debug.print(" put at idx={} (pos={}): ", .{ idx, pos });
-            // std.debug.print("T={} ", .{first_tombstone_idx});
-            // if (group.getFree()) |bit| {
-            //     std.debug.print("F={}+{}={}\n", .{ pos, bit, pos + idx });
-            // } else {
-            //     std.debug.print("F=null\n", .{});
-            // }
+            idx = first_available_idx;
+            std.debug.print("{} {} (gOPACA av)\n", .{ key, idx });
             // We're using a slot previously free or a tombstone.
             self.available -= 1;
             self.fillMetadata(idx, fingerprint);
@@ -1469,7 +1477,8 @@ pub fn SwissHashMapUnmanaged(
 
             var map = Self{};
             defer map.deinit(allocator);
-            map.init_lookups(self.num_lookups);
+            map.initLookups(self.num_lookups);
+            map.initProbeLen(self.probe_len);
             try map.allocate(allocator, new_cap);
             map.initMetadatas();
             map.available = @truncate((new_cap * max_load_percentage) / 100);
@@ -1641,31 +1650,73 @@ test "zwizz basic" {
     var map = AutoSwissHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
 
-    const count = 5;
+    var counter: u64 = 0;
+    map.unmanaged.initLookups(&counter);
+    var probe_len: u64 = 0;
+    map.unmanaged.initProbeLen(&probe_len);
+
+    const count = 100;
     var i: u32 = 1;
-    // const Group = AutoSwissHashMapUnmanaged(u32, u32).Group;
     while (i < count) : (i += 1) {
         try map.put(i, i);
-        // std.debug.print("\n{any}\n", .{map.unmanaged.metadata.?[0 .. map.capacity() + Group.width]});
     }
 
-    try map.validate();
+    std.debug.print("{}\n", .{counter});
 }
 test "zwizz groups" {
     const Unmanaged = AutoSwissHashMap(u32, u32).Unmanaged;
     const Metadata = Unmanaged.Metadata;
     const Group = Unmanaged.Group;
+    const Context = AutoContext(u32);
 
-    const b: u8 = 0x0a;
-    const arr: [16]u8 = [_]u8{ 0, 0, 0, 0, 0, 0, b, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
-    const metadata = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
-    var group = Group.init(metadata);
+    {
+        const arr: [16]u8 = [_]u8{ 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 };
+        const metadatas = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
+        var group = Group.init(metadatas);
 
-    const match = group.matchByte(b);
-    try expectEqual(match.hasMatch(), true);
-    var iter = match.iterator();
-    try expectEqual(iter.next().?, 6);
-    try expectEqual(iter.next(), null);
+        const tombstone = group.matchTombstone();
+        try expectEqual(true, tombstone.hasMatch());
+        // why is it flipped ??
+        try expectEqual(0b0100_0000_0000_1001, @as(u16, @bitCast(tombstone)));
+
+        var iter = tombstone.iterator();
+        try expectEqual(0, iter.next().?);
+        try expectEqual(3, iter.next().?);
+        try expectEqual(14, iter.next().?);
+        try expectEqual(null, iter.next());
+    }
+    {
+        //                            0     1     2     3  |  4     5     6     7  |  8     9    10    11  | 12    13    14    15
+        const arr: [16]u8 = [_]u8{ 0x80, 0x8c, 0x01, 0x01, 0x00, 0x82, 0x81, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x8a };
+        const metadatas = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
+        var group = Group.init(metadatas);
+
+        const frees = group.matchFree();
+        try expectEqual(true, frees.hasMatch());
+        try expectEqual(4, group.getFree().?);
+        try expectEqual(2, group.getTombstone().?);
+        try expectEqual(2, group.getAvailable().?);
+        var iter = group.matchByte(0x82).iterator();
+        try expectEqual(5, iter.next().?);
+    }
+    {
+        //                          0     1     2     3  |  4     5     6     7  |  8     9    10    11  | 12    13    14    15
+        var arr: [16]u8 = [_]u8{ 0x01, 0x00, 0x01, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00 };
+        const fingerprint: u7 = Metadata.takeFingerprint(Context.hash(undefined, 0));
+        const meta = @as(u8, @bitCast(Metadata{ .used = 1, .fingerprint = fingerprint }));
+        std.debug.print("\nmeta: 0x{x:0>2}\n", .{meta});
+        arr[3] = meta;
+        arr[7] = meta - 1;
+
+        const metadatas = @as([*]Metadata, @ptrCast(@constCast(&arr[0])));
+        var group = Group.init(metadatas);
+
+        const matches = group.matchByte(meta);
+        try expectEqual(true, matches.hasMatch());
+        var iter = matches.iterator();
+        try expectEqual(3, iter.next().?);
+        try expectEqual(null, iter.next());
+    }
 }
 // test "zwizz core" {
 //     const Map = AutoSwissHashMap(u32, u32);

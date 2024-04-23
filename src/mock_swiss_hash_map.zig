@@ -7,42 +7,19 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const Wyhash = std.hash.Wyhash;
 
-const testProbeLen = false;
+const testProbeLen = true;
 
-pub fn getAutoHashFn(comptime K: type, comptime Context: type) (fn (Context, K) u64) {
-    comptime {
-        assert(@hasDecl(std, "StringHashMap")); // detect when the following message needs updated
-        if (K == []const u8) {
-            @compileError("std.auto_hash.autoHash does not allow slices here (" ++
-                @typeName(K) ++
-                ") because the intent is unclear. " ++
-                "Consider using std.StringHashMap for hashing the contents of []const u8. " ++
-                "Alternatively, consider using std.auto_hash.hash or providing your own hash function instead.");
-        }
-    }
-
-    return struct {
-        fn hash(ctx: Context, key: K) u64 {
-            _ = ctx;
-            if (std.meta.hasUniqueRepresentation(K)) {
-                return Wyhash.hash(0, std.mem.asBytes(&key));
-            } else {
-                var hasher = Wyhash.init(0);
-                autoHash(&hasher, key);
-                return hasher.final();
-            }
-        }
-    }.hash;
-}
-
-pub fn getAutoEqlFn(comptime K: type, comptime Context: type) (fn (Context, K, K) bool) {
-    return struct {
-        fn eql(ctx: Context, a: K, b: K) bool {
-            _ = ctx;
-            return std.meta.eql(a, b);
-        }
-    }.eql;
-}
+// Reuse functions and types from std/hash_map.zig
+const hash_map = std.hash_map;
+pub const getAutoHashFn = hash_map.getAutoHashFn;
+pub const getAutoEqlFn = hash_map.getAutoEqlFn;
+pub const AutoContext = hash_map.AutoContext;
+pub const StringContext = hash_map.StringContext;
+pub const eqlString = hash_map.eqlString;
+pub const hashString = hash_map.hashString;
+pub const StringIndexContext = hash_map.StringIndexContext;
+pub const StringIndexAdapter = hash_map.StringIndexAdapter;
+pub const verifyContext = hash_map.verifyContext;
 
 pub fn AutoHashMap(comptime K: type, comptime V: type) type {
     return HashMap(K, V, AutoContext(K), default_max_load_percentage);
@@ -50,13 +27,6 @@ pub fn AutoHashMap(comptime K: type, comptime V: type) type {
 
 pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type {
     return HashMapUnmanaged(K, V, AutoContext(K), default_max_load_percentage);
-}
-
-pub fn AutoContext(comptime K: type) type {
-    return struct {
-        pub const hash = getAutoHashFn(K, @This());
-        pub const eql = getAutoEqlFn(K, @This());
-    };
 }
 
 /// Builtin hashmap for strings as keys.
@@ -72,277 +42,7 @@ pub fn StringHashMapUnmanaged(comptime V: type) type {
     return HashMapUnmanaged([]const u8, V, StringContext, default_max_load_percentage);
 }
 
-pub const StringContext = struct {
-    pub fn hash(self: @This(), s: []const u8) u64 {
-        _ = self;
-        return hashString(s);
-    }
-    pub fn eql(self: @This(), a: []const u8, b: []const u8) bool {
-        _ = self;
-        return eqlString(a, b);
-    }
-};
-
-pub fn eqlString(a: []const u8, b: []const u8) bool {
-    return mem.eql(u8, a, b);
-}
-
-pub fn hashString(s: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, s);
-}
-
-pub const StringIndexContext = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
-
-    pub fn eql(_: @This(), a: u32, b: u32) bool {
-        return a == b;
-    }
-
-    pub fn hash(ctx: @This(), key: u32) u64 {
-        return hashString(mem.sliceTo(ctx.bytes.items[key..], 0));
-    }
-};
-
-pub const StringIndexAdapter = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
-
-    pub fn eql(ctx: @This(), a: []const u8, b: u32) bool {
-        return mem.eql(u8, a, mem.sliceTo(ctx.bytes.items[b..], 0));
-    }
-
-    pub fn hash(_: @This(), adapted_key: []const u8) u64 {
-        assert(mem.indexOfScalar(u8, adapted_key, 0) == null);
-        return hashString(adapted_key);
-    }
-};
-
 pub const default_max_load_percentage = 80;
-
-/// This function issues a compile error with a helpful message if there
-/// is a problem with the provided context type.  A context must have the following
-/// member functions:
-///   - hash(self, PseudoKey) Hash
-///   - eql(self, PseudoKey, Key) bool
-///
-/// If you are passing a context to a *Adapted function, PseudoKey is the type
-/// of the key parameter.  Otherwise, when creating a HashMap or HashMapUnmanaged
-/// type, PseudoKey = Key = K.
-pub fn verifyContext(
-    comptime RawContext: type,
-    comptime PseudoKey: type,
-    comptime Key: type,
-    comptime Hash: type,
-    comptime is_array: bool,
-) void {
-    comptime {
-        var allow_const_ptr = false;
-        var allow_mutable_ptr = false;
-        // Context is the actual namespace type.  RawContext may be a pointer to Context.
-        var Context = RawContext;
-        // Make sure the context is a namespace type which may have member functions
-        switch (@typeInfo(Context)) {
-            .Struct, .Union, .Enum => {},
-            // Special-case .Opaque for a better error message
-            .Opaque => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context) ++ " because it is opaque.  Use a pointer instead."),
-            .Pointer => |ptr| {
-                if (ptr.size != .One) {
-                    @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context) ++ " because it is not a single pointer.");
-                }
-                Context = ptr.child;
-                allow_const_ptr = true;
-                allow_mutable_ptr = !ptr.is_const;
-                switch (@typeInfo(Context)) {
-                    .Struct, .Union, .Enum, .Opaque => {},
-                    else => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context)),
-                }
-            },
-            else => @compileError("Hash context must be a type with hash and eql member functions.  Cannot use " ++ @typeName(Context)),
-        }
-
-        // Keep track of multiple errors so we can report them all.
-        var errors: []const u8 = "";
-
-        // Put common errors here, they will only be evaluated
-        // if the error is actually triggered.
-        const lazy = struct {
-            const prefix = "\n  ";
-            const deep_prefix = prefix ++ "  ";
-            const hash_signature = "fn (self, " ++ @typeName(PseudoKey) ++ ") " ++ @typeName(Hash);
-            const index_param = if (is_array) ", b_index: usize" else "";
-            const eql_signature = "fn (self, " ++ @typeName(PseudoKey) ++ ", " ++
-                @typeName(Key) ++ index_param ++ ") bool";
-            const err_invalid_hash_signature = prefix ++ @typeName(Context) ++ ".hash must be " ++ hash_signature ++
-                deep_prefix ++ "but is actually " ++ @typeName(@TypeOf(Context.hash));
-            const err_invalid_eql_signature = prefix ++ @typeName(Context) ++ ".eql must be " ++ eql_signature ++
-                deep_prefix ++ "but is actually " ++ @typeName(@TypeOf(Context.eql));
-        };
-
-        // Verify Context.hash(self, PseudoKey) => Hash
-        if (@hasDecl(Context, "hash")) {
-            const hash = Context.hash;
-            const info = @typeInfo(@TypeOf(hash));
-            if (info == .Fn) {
-                const func = info.Fn;
-                if (func.params.len != 2) {
-                    errors = errors ++ lazy.err_invalid_hash_signature;
-                } else {
-                    var emitted_signature = false;
-                    if (func.params[0].type) |Self| {
-                        if (Self == Context) {
-                            // pass, this is always fine.
-                        } else if (Self == *const Context) {
-                            if (!allow_const_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_hash_signature;
-                                    emitted_signature = true;
-                                }
-                                errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
-                                errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                            }
-                        } else if (Self == *Context) {
-                            if (!allow_mutable_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_hash_signature;
-                                    emitted_signature = true;
-                                }
-                                if (!allow_const_ptr) {
-                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                                } else {
-                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ " or " ++ @typeName(*const Context) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be non-const because it is passed by const pointer.";
-                                }
-                            }
-                        } else {
-                            if (!emitted_signature) {
-                                errors = errors ++ lazy.err_invalid_hash_signature;
-                                emitted_signature = true;
-                            }
-                            errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context);
-                            if (allow_const_ptr) {
-                                errors = errors ++ " or " ++ @typeName(*const Context);
-                                if (allow_mutable_ptr) {
-                                    errors = errors ++ " or " ++ @typeName(*Context);
-                                }
-                            }
-                            errors = errors ++ ", but is " ++ @typeName(Self);
-                        }
-                    }
-                    if (func.params[1].type != null and func.params[1].type.? != PseudoKey) {
-                        if (!emitted_signature) {
-                            errors = errors ++ lazy.err_invalid_hash_signature;
-                            emitted_signature = true;
-                        }
-                        errors = errors ++ lazy.deep_prefix ++ "Second parameter must be " ++ @typeName(PseudoKey) ++ ", but is " ++ @typeName(func.params[1].type.?);
-                    }
-                    if (func.return_type != null and func.return_type.? != Hash) {
-                        if (!emitted_signature) {
-                            errors = errors ++ lazy.err_invalid_hash_signature;
-                            emitted_signature = true;
-                        }
-                        errors = errors ++ lazy.deep_prefix ++ "Return type must be " ++ @typeName(Hash) ++ ", but was " ++ @typeName(func.return_type.?);
-                    }
-                    // If any of these are generic (null), we cannot verify them.
-                    // The call sites check the return type, but cannot check the
-                    // parameters.  This may cause compile errors with generic hash/eql functions.
-                }
-            } else {
-                errors = errors ++ lazy.err_invalid_hash_signature;
-            }
-        } else {
-            errors = errors ++ lazy.prefix ++ @typeName(Context) ++ " must declare a pub hash function with signature " ++ lazy.hash_signature;
-        }
-
-        // Verify Context.eql(self, PseudoKey, Key) => bool
-        if (@hasDecl(Context, "eql")) {
-            const eql = Context.eql;
-            const info = @typeInfo(@TypeOf(eql));
-            if (info == .Fn) {
-                const func = info.Fn;
-                const args_len = if (is_array) 4 else 3;
-                if (func.params.len != args_len) {
-                    errors = errors ++ lazy.err_invalid_eql_signature;
-                } else {
-                    var emitted_signature = false;
-                    if (func.params[0].type) |Self| {
-                        if (Self == Context) {
-                            // pass, this is always fine.
-                        } else if (Self == *const Context) {
-                            if (!allow_const_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_eql_signature;
-                                    emitted_signature = true;
-                                }
-                                errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
-                                errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                            }
-                        } else if (Self == *Context) {
-                            if (!allow_mutable_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_eql_signature;
-                                    emitted_signature = true;
-                                }
-                                if (!allow_const_ptr) {
-                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                                } else {
-                                    errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context) ++ " or " ++ @typeName(*const Context) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be non-const because it is passed by const pointer.";
-                                }
-                            }
-                        } else {
-                            if (!emitted_signature) {
-                                errors = errors ++ lazy.err_invalid_eql_signature;
-                                emitted_signature = true;
-                            }
-                            errors = errors ++ lazy.deep_prefix ++ "First parameter must be " ++ @typeName(Context);
-                            if (allow_const_ptr) {
-                                errors = errors ++ " or " ++ @typeName(*const Context);
-                                if (allow_mutable_ptr) {
-                                    errors = errors ++ " or " ++ @typeName(*Context);
-                                }
-                            }
-                            errors = errors ++ ", but is " ++ @typeName(Self);
-                        }
-                    }
-                    if (func.params[1].type.? != PseudoKey) {
-                        if (!emitted_signature) {
-                            errors = errors ++ lazy.err_invalid_eql_signature;
-                            emitted_signature = true;
-                        }
-                        errors = errors ++ lazy.deep_prefix ++ "Second parameter must be " ++ @typeName(PseudoKey) ++ ", but is " ++ @typeName(func.params[1].type.?);
-                    }
-                    if (func.params[2].type.? != Key) {
-                        if (!emitted_signature) {
-                            errors = errors ++ lazy.err_invalid_eql_signature;
-                            emitted_signature = true;
-                        }
-                        errors = errors ++ lazy.deep_prefix ++ "Third parameter must be " ++ @typeName(Key) ++ ", but is " ++ @typeName(func.params[2].type.?);
-                    }
-                    if (func.return_type.? != bool) {
-                        if (!emitted_signature) {
-                            errors = errors ++ lazy.err_invalid_eql_signature;
-                            emitted_signature = true;
-                        }
-                        errors = errors ++ lazy.deep_prefix ++ "Return type must be bool, but was " ++ @typeName(func.return_type.?);
-                    }
-                    // If any of these are generic (null), we cannot verify them.
-                    // The call sites check the return type, but cannot check the
-                    // parameters.  This may cause compile errors with generic hash/eql functions.
-                }
-            } else {
-                errors = errors ++ lazy.err_invalid_eql_signature;
-            }
-        } else {
-            errors = errors ++ lazy.prefix ++ @typeName(Context) ++ " must declare a pub eql function with signature " ++ lazy.eql_signature;
-        }
-
-        if (errors.len != 0) {
-            // errors begins with a newline (from lazy.prefix)
-            @compileError("Problems found with hash context type " ++ @typeName(Context) ++ ":" ++ errors);
-        }
-    }
-}
 
 /// General purpose hash table.
 /// No order is guaranteed and any modification invalidates live iterators.
@@ -724,15 +424,26 @@ pub fn HashMapUnmanaged(
         /// `max_load_percentage`.
         available: Size = 0,
 
-        num_lookups: *u64 = undefined,
+        // [DEBUG] Used to the track total number of lookups of a map
+        num_lookups: ?*u64 = null,
 
-        pub fn init_lookups(self: *Self, ptr: *u64) void {
+        // [DEBUG]
+        probe_len: ?*u64 = null,
+
+        pub fn initLookups(self: *Self, ptr: ?*u64) void {
             self.num_lookups = ptr;
+        }
+
+        pub fn initProbeLen(self: *Self, ptr: ?*u64) void {
+            self.probe_len = ptr;
+        }
+        pub fn getProbeLen(self: Self) ?u64 {
+            return if (self.probe_len) |p| p.* else null;
         }
 
         // This is purely empirical and not a /very smart magic constant™/.
         /// Capacity of the first grow when bootstrapping the hashmap.
-        const minimal_capacity = 8;
+        const minimal_capacity = 16;
 
         // This hashmap is specially designed for sizes that fit in a u32.
         pub const Size = u32;
@@ -844,6 +555,50 @@ pub fn HashMapUnmanaged(
                 return null;
             }
         };
+
+        pub const ProbeSeq = struct {
+            const width: u32 = 16;
+            mask: u32,
+            pos: u32,
+            bit: u32 = 0,
+            stride: u32 = 0,
+
+            pub fn init(idx: u32, cap: u32) @This() {
+                return @This(){
+                    .mask = cap - 1,
+                    .pos = idx,
+                };
+            }
+
+            pub fn next(self: *@This()) struct { u32, bool } {
+                if (self.bit == width - 1) {
+                    self.bit = 0;
+                    self.stride += 1;
+                    self.pos = (self.pos + self.stride * width) & self.mask;
+                }
+
+                const idx = self.pos + self.bit;
+                defer self.bit += 1;
+
+                return .{ idx & self.mask, self.bit == 0 };
+            }
+        };
+
+        pub fn initProbeSeq(self: Self, idx: usize, cap: u32) ProbeSeq {
+            if (self.probe_len) |p| p.* = 0;
+            return ProbeSeq.init(@as(u32, @truncate(idx)), cap);
+        }
+
+        pub fn nextIdx(self: Self, probe_seq: *ProbeSeq) u32 {
+            const ret = probe_seq.next();
+            const idx = ret[0];
+            const new_group = ret[1];
+            if (new_group) {
+                if (self.num_lookups) |p| p.* += 1;
+                if (self.probe_len) |p| p.* += 1;
+            }
+            return idx;
+        }
 
         pub const KeyIterator = FieldIterator(K);
         pub const ValueIterator = FieldIterator(V);
@@ -1032,23 +787,24 @@ pub fn HashMapUnmanaged(
             return self.putAssumeCapacityNoClobberContext(key, value, undefined);
         }
         pub fn putAssumeCapacityNoClobberContext(self: *Self, key: K, value: V, ctx: Context) void {
-            if (true) unreachable;
             assert(!self.containsContext(key, ctx));
 
             const hash = ctx.hash(key);
-            var probe_len: u32 = 1;
-            defer cprint(@popCount(hash) == 15 and testProbeLen, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
+
             const mask = self.capacity() - 1;
-            var idx = @as(usize, @truncate(hash & mask));
+            const pos = @as(usize, @truncate(hash & mask));
+
+            var probe_seq = self.initProbeSeq(pos, self.capacity());
+            var idx = self.nextIdx(&probe_seq);
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
 
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (metadata[0].isUsed()) {
-                probe_len += 1;
-                idx = (idx + 1) & mask;
+                idx = self.nextIdx(&probe_seq);
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
+
+            std.debug.print("{} {} (pACNCC)\n", .{ key, idx });
 
             assert(self.available > 0);
             self.available -= 1;
@@ -1137,7 +893,7 @@ pub fn HashMapUnmanaged(
         /// fuse the basic blocks after the branch to the basic blocks
         /// from this function.  To encourage that, this function is
         /// marked as inline.
-        inline fn getIndex(self: *Self, key: anytype, ctx: anytype) ?usize {
+        inline fn getIndex(self: Self, key: anytype, ctx: anytype) ?usize {
             comptime verifyContext(@TypeOf(ctx), @TypeOf(key), K, Hash, false);
 
             if (self.size == 0) {
@@ -1147,8 +903,7 @@ pub fn HashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            var probe_len: u32 = 1;
-            defer cprint(@popCount(hash) == 15 and testProbeLen, "{}, {}, {?}\n", .{ self.capacity(), self.size, probe_len });
+            // const cond = @popCount(hash) == 15 and testProbeLen;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
@@ -1158,12 +913,14 @@ pub fn HashMapUnmanaged(
             const fingerprint = Metadata.takeFingerprint(hash);
             // Don't loop indefinitely when there are no empty slots.
             var limit = self.capacity();
-            var idx = @as(usize, @truncate(hash & mask));
+            const pos = @as(usize, @truncate(hash & mask));
+
+            var probe_seq = self.initProbeSeq(pos, self.capacity());
+            var idx = self.nextIdx(&probe_seq);
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
 
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (!metadata[0].isFree() and limit != 0) {
-                probe_len += 1;
                 if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
                     const test_key = &self.keys()[idx];
                     // If you get a compile error on this line, it means that your generic eql
@@ -1175,16 +932,16 @@ pub fn HashMapUnmanaged(
                         @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                     }
                     if (eql) {
+                        std.debug.print("{} {} (gI)\n", .{ key, idx });
                         return idx;
                     }
                 }
 
                 limit -= 1;
-                idx = (idx + 1) & mask;
+                idx = self.nextIdx(&probe_seq);
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
-
+            std.debug.print("{} null (gI)\n", .{key});
             return null;
         }
 
@@ -1331,8 +1088,6 @@ pub fn HashMapUnmanaged(
             // If you get a compile error on this line, it means that your generic hash
             // function is invalid for these parameters.
             const hash = ctx.hash(key);
-            const cond = @popCount(hash) == 15 and testProbeLen;
-            var probe_len: u32 = 1;
             // verifyContext can't verify the return type of generic hash functions,
             // so we need to double-check it here.
             if (@TypeOf(hash) != Hash) {
@@ -1341,13 +1096,15 @@ pub fn HashMapUnmanaged(
             const mask = self.capacity() - 1;
             const fingerprint = Metadata.takeFingerprint(hash);
             var limit = self.capacity();
-            var idx = @as(usize, @truncate(hash & mask));
+            const pos = @as(usize, @truncate(hash & mask));
+
+            defer cprint(true, "-> {?}\n", .{self.getProbeLen()});
+            var probe_seq = self.initProbeSeq(pos, self.capacity());
+            var idx = self.nextIdx(&probe_seq);
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (!metadata[0].isFree() and limit != 0) {
-                probe_len += 1;
                 if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
                     const test_key = &self.keys()[idx];
                     // If you get a compile error on this line, it means that your generic eql
@@ -1359,7 +1116,7 @@ pub fn HashMapUnmanaged(
                         @compileError("Context " ++ @typeName(@TypeOf(ctx)) ++ " has a generic eql function that returns the wrong type! bool was expected, but found " ++ @typeName(@TypeOf(eql)));
                     }
                     if (eql) {
-                        cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
+                        std.debug.print("{} {} (gOPACA eq)\n", .{ key, idx });
                         return GetOrPutResult{
                             .key_ptr = test_key,
                             .value_ptr = &self.values()[idx],
@@ -1371,18 +1128,17 @@ pub fn HashMapUnmanaged(
                 }
 
                 limit -= 1;
-                idx = (idx + 1) & mask;
+                idx = self.nextIdx(&probe_seq);
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
 
             if (first_tombstone_idx < self.capacity()) {
                 // Cheap try to lower probing lengths after deletions. Recycle a tombstone.
-                idx = first_tombstone_idx;
+                idx = @as(u32, @truncate(first_tombstone_idx));
                 metadata = self.metadata.? + idx;
             }
 
-            cprint(cond, "{}, {}, {}\n", .{ self.capacity(), self.size, probe_len });
+            std.debug.print("{} {} (gOPACA av)\n", .{ key, idx });
 
             // We're using a slot previously free or a tombstone.
             self.available -= 1;
@@ -1416,15 +1172,15 @@ pub fn HashMapUnmanaged(
         }
 
         /// Return true if there is a value associated with key in the map.
-        pub fn contains(self: *Self, key: K) bool {
+        pub fn contains(self: *const Self, key: K) bool {
             if (@sizeOf(Context) != 0)
                 @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call containsContext instead.");
             return self.containsContext(key, undefined);
         }
-        pub fn containsContext(self: *Self, key: K, ctx: Context) bool {
+        pub fn containsContext(self: Self, key: K, ctx: Context) bool {
             return self.containsAdapted(key, ctx);
         }
-        pub fn containsAdapted(self: *Self, key: anytype, ctx: anytype) bool {
+        pub fn containsAdapted(self: Self, key: anytype, ctx: anytype) bool {
             return self.getIndex(key, ctx) != null;
         }
 
@@ -1536,7 +1292,8 @@ pub fn HashMapUnmanaged(
 
             var map = Self{};
             defer map.deinit(allocator);
-            map.init_lookups(self.num_lookups);
+            map.initLookups(self.num_lookups);
+            map.initProbeLen(self.probe_len);
             try map.allocate(allocator, new_cap);
             map.initMetadatas();
             map.available = @truncate((new_cap * max_load_percentage) / 100);
@@ -1645,6 +1402,23 @@ fn cprint(expr: bool, comptime fmt: []const u8, args: anytype) void {
     if (expr) std.debug.print(fmt, args);
 }
 
+test "zwizz basic" {
+    var map = AutoHashMap(u32, u32).init(std.testing.allocator);
+    defer map.deinit();
+
+    var counter: u64 = 0;
+    map.unmanaged.initLookups(&counter);
+    var probe_len: u64 = 0;
+    map.unmanaged.initProbeLen(&probe_len);
+
+    const count = 100;
+    var i: u32 = 1;
+    while (i < count) : (i += 1) {
+        try map.put(i, i);
+    }
+
+    std.debug.print("{}\n", .{counter});
+}
 test "basic usage" {
     var map = AutoHashMap(u32, u32).init(std.testing.allocator);
     defer map.deinit();
@@ -2120,11 +1894,11 @@ test "basic hash map usage" {
 
 test "getOrPutAdapted" {
     const AdaptedContext = struct {
-        fn eql(self: @This(), adapted_key: []const u8, test_key: u64) bool {
+        pub fn eql(self: @This(), adapted_key: []const u8, test_key: u64) bool {
             _ = self;
             return std.fmt.parseInt(u64, adapted_key, 10) catch unreachable == test_key;
         }
-        fn hash(self: @This(), adapted_key: []const u8) u64 {
+        pub fn hash(self: @This(), adapted_key: []const u8) u64 {
             _ = self;
             const key = std.fmt.parseInt(u64, adapted_key, 10) catch unreachable;
             return (AutoContext(u64){}).hash(key);

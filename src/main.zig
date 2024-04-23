@@ -1,10 +1,12 @@
 const std = @import("std");
 const swiss = @import("swiss_hash_map.zig");
+const mock = @import("mock_swiss_hash_map.zig");
 const hm = @import("hash_map.zig");
 
 pub fn main() !void {
     // const l = lookups(hm.AutoHashMap(u32, u32));
     const l = lookups(swiss.AutoSwissHashMap(u32, u32));
+    // const l = lookups(mock.AutoHashMap(u32, u32));
     std.debug.print("{}\n", .{l});
 }
 
@@ -13,8 +15,13 @@ fn lookups(Map: type) u64 {
     const n = 10_000 * 1000;
     var map = Map.init(std.heap.page_allocator);
     defer map.deinit();
+
     var counter: u64 = 0;
-    map.unmanaged.init_lookups(&counter);
+    map.unmanaged.initLookups(&counter);
+    var probe_len: u64 = 0;
+    map.unmanaged.initProbeLen(&probe_len);
+
+    std.debug.assert(map.unmanaged.probe_len != null);
 
     var keys = std.ArrayList(u32).init(std.heap.page_allocator);
     defer keys.deinit();
