@@ -724,12 +724,6 @@ pub fn HashMapUnmanaged(
         /// `max_load_percentage`.
         available: Size = 0,
 
-        num_lookups: *u64 = undefined,
-
-        pub fn init_lookups(self: *Self, ptr: *u64) void {
-            self.num_lookups = ptr;
-        }
-
         // This is purely empirical and not a /very smart magic constant™/.
         /// Capacity of the first grow when bootstrapping the hashmap.
         const minimal_capacity = 8;
@@ -1042,12 +1036,10 @@ pub fn HashMapUnmanaged(
             var idx = @as(usize, @truncate(hash & mask));
 
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (metadata[0].isUsed()) {
                 probe_len += 1;
                 idx = (idx + 1) & mask;
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
 
             assert(self.available > 0);
@@ -1161,7 +1153,6 @@ pub fn HashMapUnmanaged(
             var idx = @as(usize, @truncate(hash & mask));
 
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (!metadata[0].isFree() and limit != 0) {
                 probe_len += 1;
                 if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
@@ -1182,7 +1173,6 @@ pub fn HashMapUnmanaged(
                 limit -= 1;
                 idx = (idx + 1) & mask;
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
 
             return null;
@@ -1345,7 +1335,6 @@ pub fn HashMapUnmanaged(
 
             var first_tombstone_idx: usize = self.capacity(); // invalid index
             var metadata = self.metadata.? + idx;
-            self.num_lookups.* += 1;
             while (!metadata[0].isFree() and limit != 0) {
                 probe_len += 1;
                 if (metadata[0].isUsed() and metadata[0].fingerprint == fingerprint) {
@@ -1373,7 +1362,6 @@ pub fn HashMapUnmanaged(
                 limit -= 1;
                 idx = (idx + 1) & mask;
                 metadata = self.metadata.? + idx;
-                self.num_lookups.* += 1;
             }
 
             if (first_tombstone_idx < self.capacity()) {
@@ -1536,7 +1524,6 @@ pub fn HashMapUnmanaged(
 
             var map = Self{};
             defer map.deinit(allocator);
-            map.init_lookups(self.num_lookups);
             try map.allocate(allocator, new_cap);
             map.initMetadatas();
             map.available = @truncate((new_cap * max_load_percentage) / 100);
