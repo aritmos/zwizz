@@ -17,4 +17,9 @@ zig-out/
 /build-*/
 /docgen_tmp/
 
+# Don't track testing files
+src/_*
+
+# Testing files
 .venv
+.justfile

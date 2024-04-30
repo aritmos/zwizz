@@ -1,5 +1,8 @@
 const std = @import("std");
 const swiss = @import("swiss_hash_map.zig");
+// Used for performance testing and comparisons.
+// The mock swiss hash map immitates the probing path of a swiss hash map,
+// but checks individual buckets like the std's implementation.
 // const mock = @import("mock_swiss_hash_map.zig");
 // const hm = @import("hash_map.zig");
 
