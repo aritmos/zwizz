@@ -1,18 +1,18 @@
 const std = @import("std");
 const swiss = @import("swiss_hash_map.zig");
-const mock = @import("mock_swiss_hash_map.zig");
-const hm = @import("hash_map.zig");
+// const mock = @import("mock_swiss_hash_map.zig");
+// const hm = @import("hash_map.zig");
 
 pub fn main() !void {
-    run(std.hash_map.AutoHashMap(u32, u32));
-    // run(swiss.AutoSwissHashMap(u32, u32));
+    // run(std.hash_map.AutoHashMap(u32, u32));
+    run(swiss.AutoSwissHashMap(u32, u32));
     // const l = lookups(mock.AutoHashMap(u32, u32));
     // std.debug.print("{}\n", .{l});
 }
 
 // 10M random put and remove
 fn run(Map: type) void {
-    const n = 10_000 * 1000;
+    const n = 10_000 * 1_000;
     var map = Map.init(std.heap.page_allocator);
     defer map.deinit();
 

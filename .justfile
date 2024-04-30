@@ -15,3 +15,14 @@ count file:
 counts:
     just count zwz_uq.dat
     just count zwz_mock.dat
+
+alias tf := transfer
+
+windir := '/mnt/c/Users/Sebastian/Desktop/zwizz'
+transfer:
+    cp src/main.zig {{windir}}/src/main.zig
+    cp src/swiss_hash_map.zig {{windir}}/src/swiss_hash_map.zig
+
+alias b := build
+build name:
+    zig build-exe -O ReleaseFast --name {{name}} src/main.zig

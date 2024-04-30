@@ -40,7 +40,7 @@ pub fn StringSwissHashMapUnmanaged(comptime V: type) type {
     return SwissHashMapUnmanaged([]const u8, V, StringContext, default_max_load_percentage);
 }
 
-pub const default_max_load_percentage = 80;
+pub const default_max_load_percentage = 93;
 
 /// General purpose hash table.
 /// No order is guaranteed and any modification invalidates live iterators.
@@ -1024,7 +1024,7 @@ pub fn SwissHashMapUnmanaged(
                 limit -= 1;
                 // TODO: remove limit and make the conditional the stride assertion?
                 // no `assert(stride < self.capacity())` needed as this is covered by limit
-                stride += 1; // quadratic probing
+                stride += 1;
                 pos = (pos + stride * Group.width) & mask;
             }) {
                 const group = Group.init(self.metadata.? + pos);
@@ -1207,14 +1207,14 @@ pub fn SwissHashMapUnmanaged(
             var pos = @as(usize, @truncate(hash & mask));
             var stride: u32 = 0;
 
-            var first_available_idx: usize = self.capacity() + Group.width; // invalid index
-            var group = Group.init(self.metadata.? + pos);
+            const overflow_idx: usize = self.capacity() + Group.width; // invalid index
+            var first_available_idx = overflow_idx;
             while (limit != 0) : ({
                 limit -= 1;
                 stride += 1;
                 pos = (pos + stride * Group.width) & mask;
-                group = Group.init(self.metadata.? + pos);
             }) {
+                const group = Group.init(self.metadata.? + pos);
                 const bitmask = group.matchFingerprint(fingerprint);
                 if (bitmask.hasMatch()) {
                     var iter = bitmask.iterator();
@@ -1238,7 +1238,7 @@ pub fn SwissHashMapUnmanaged(
                         }
                     }
                 }
-                if (first_available_idx == self.capacity() + Group.width) {
+                if (first_available_idx == overflow_idx) {
                     if (group.getAvailable()) |bit| first_available_idx = (pos + bit) & mask;
                 }
 
@@ -1616,7 +1616,7 @@ test "zwizz groups" {
         var arr: [16]u8 = [_]u8{ 0x01, 0x00, 0x01, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00 };
         const fingerprint: u7 = Metadata.takeFingerprint(Context.hash(undefined, 0));
         const meta = @as(u8, @bitCast(Metadata{ .used = 1, .fingerprint = fingerprint }));
-        std.debug.print("\nmeta: 0x{x:0>2}\n", .{meta});
+        // std.debug.print("\nmeta: 0x{x:0>2}\n", .{meta});
         arr[3] = meta;
         arr[7] = meta - 1;
 
